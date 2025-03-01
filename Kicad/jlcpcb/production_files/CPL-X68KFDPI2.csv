@@ -1,0 +1,30 @@
+Designator,Val,Package,Mid X,Mid Y,Rotation,Layer
+BZ1,Buzzer,Buzzer_12x9.5RM7.6,130.075,-93.975,0.0,top
+D1,1N5817,D_DO-15_P12.70mm_Horizontal,147.3,-111.85,90.0,top
+D2,LED,LED_D3.0mm,79.13,-118.15,0.0,top
+D3,LED,LED_D3.0mm,79.055,-128.75,0.0,top
+J1,HxC Connector,IDC-Header_2x17_P2.54mm_Horizontal,110.365,-133.655,-90.0,top
+J11,Micro_SD_Card,J_SD_Card-micro_socket_A,145.400032,-136.400045,180.0,top
+J13,"FD Int/Ext (0,1/2,3)",PinHeader_1x03_P2.54mm_Vertical,80.375,-49.31,0.0,top
+J2,FD Ext Connector,IDC-Header_2x17_P2.54mm_Horizontal,112.54,-52.445,90.0,top
+J3,FD00,JST_PH_B4B-PH-K_1x04_P2.00mm_Vertical,72.9,-64.11,90.0,top
+J4,FD01,JST_PH_B4B-PH-K_1x04_P2.00mm_Vertical,72.9,-77.385,90.0,top
+J7,LedFD0,JST_PH_B3B-PH-K_1x03_P2.00mm_Vertical,72.9,-92.235,90.0,top
+J8,LedFD1,JST_PH_B3B-PH-K_1x03_P2.00mm_Vertical,72.9,-103.11,90.0,top
+J9,FloppyPWR,PinHeader_1x04_P2.54mm_Horizontal,143.65,-62.06,0.0,top
+R1,R330,R_Axial_DIN0207_L6.3mm_D2.5mm_P10.16mm_Horizontal,80.075,-63.475,90.0,top
+R10,4.7K,R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,146.45,-90.51,90.0,top
+R11,4.7K,R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,150.9,-90.685,90.0,top
+R2,R330,R_Axial_DIN0207_L6.3mm_D2.5mm_P10.16mm_Horizontal,80.125,-76.695,90.0,top
+R3,R330,R_Axial_DIN0207_L6.3mm_D2.5mm_P10.16mm_Horizontal,80.2,-90.245,90.0,top
+R4,R330,R_Axial_DIN0207_L6.3mm_D2.5mm_P10.16mm_Horizontal,83.7,-90.245,90.0,top
+R5,R330,R_Axial_DIN0207_L6.3mm_D2.5mm_P10.16mm_Horizontal,87.3,-90.245,90.0,top
+R6,R330,R_Axial_DIN0207_L6.3mm_D2.5mm_P10.16mm_Horizontal,90.875,-90.245,90.0,top
+R7,10k,R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,79.4,-108.575,-90.0,top
+R8,10k,R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,79.275,-136.635,-90.0,top
+R9,4.7K,R_Axial_DIN0207_L6.3mm_D2.5mm_P7.62mm_Horizontal,141.825,-90.685,90.0,top
+RP1,PicoW,Raspberry_Pi_PicoW_SMT_THT,114.03,-113.99,90.0,top
+SW1,SW_Push,SW_Tactile_SPST_Angled_PTS645Vx83-2LFS,73.0175,-117.745,90.0,top
+SW2,SW_Push,SW_Tactile_SPST_Angled_PTS645Vx83-2LFS,73.0175,-129.63,90.0,top
+U1,Pico,Raspberry_Pi_PicoW_SMT_THT,114.03,-69.99,90.0,top
+U2,74LVC245,DIP-20_W7.62mm_Socket,108.08,-91.015,90.0,top
