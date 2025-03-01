@@ -1,18 +1,12 @@
 # X68KFDPi2W
 X68KFDPi2W - Floppies drive emulator All-In-One for Sharp X68000
 
+The design is an evolution of my previous X68KFDPico, and allows the two drives of the X68000 to be emulated both externally and internally connected. The engine of the emulator are two Raspberry Pico, one ‘normal’ to handle the special floppy signals and the other ‘W’ to emulate the floppies, SDcard image management and a simple web server to choose the disks to be inserted in the floppies.
+Ejection and insertion of the disks can be done via the two keys in the X68KFDPi2W or by connecting the cables of the original floppy keys (in case they are not present internally). The same for the internal LEDs, which are however replicated in the emulator (only the green one, the red LED is managed only for the internal one).
 
-Flashcart for Atari 2600 and Atari 7800 based on Pico "Purple" clone, easy to build and cheap.
-This is a "double-face" flashcart, it could be used for both Atari 2600 and Atari 7800, simply rotating it and inserting the cart in different Atari!!
-It doesn't support all bank-switching schemas, but enough to enjoy your A2600 / A7800 with a single flash-carts!!
+A special thanks to Adafruit team for their great "Floppy library", from wich i starded for floppy emulation part.
 
-A special thanks to other opensource project for Atari multicarts from which i got a lot of info, ideas and also code:
-https://github.com/robinhedwards/UnoCart-2600
-
-https://github.com/karrika/Otaku-flash
-
-
-![ScreenShot](https://raw.githubusercontent.com/aotta/PicoA10400/main/pictures/picoA10400_06.jpg)
+![ScreenShot](https://raw.githubusercontent.com/aotta/X68KFDPi2W/main/pictures/X68KFDPi2W_board.jpg)
 
 **WARNING!** "purple" Pico has not the same pinout of original Raspberry "green" ones, you MUST use the clone or you may damage your hardware.
 Also note that the battery used is a RECHARGEABLE LIR2032, if you want to use a NON reachargeable battery you must add a diode in circuit!!!
