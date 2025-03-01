@@ -24,6 +24,7 @@ The 2 lines related to the default floppys can be omitted and changed everytime 
 
 Gerbers file are provided for the PCB, add you pico clone, and flash the firmware ".uf2" in the Pico and in the Pico W by connecting it while pressing button on Pico and drop it in the opened windows on PC.
 
+For any comments or questions about the projects, please use the official thread in the forum: https://nfggames.com/forum2/index.php?topic=7512.0
 
 
 
