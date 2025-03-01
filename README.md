@@ -8,7 +8,7 @@ Writing to floppy is not supported yes (may be in future...)
 
 A special thanks to Adafruit team for their great "Floppy library", from wich i starded for floppy emulation part.
 
-![ScreenShot](https://raw.githubusercontent.com/aotta/X68KFDPi2W/main/pictures/X68KFDPi2W_Board.jpg)
+![ScreenShot](https://raw.githubusercontent.com/aotta/X68KFDPi2W/main/pictures/X68KFDIPi2W_Board.jpg)
 
 **WARNING!** "purple" Pico has not the same pinout of original Raspberry "green" ones, you MUST use the clone or you may damage your hardware.
 Also note that the battery used is a RECHARGEABLE LIR2032, if you want to use a NON reachargeable battery you must add a diode in circuit!!!
