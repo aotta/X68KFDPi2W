@@ -104,8 +104,8 @@ void loop() {
   
 
   unsigned short int BlinkCounter=0;
-  //  if (digitalRead(INTEXT)) { //poivia
-    if (0) {  //poivia
+  if (digitalRead(INTEXT)) { //poivia
+  //  if (0) {  //debug 0 force drive 0/1, 1 force drive 2/3
       OPTA=OPT0;
       OPTB=OPT1;
       Serial.print("Drive 0/1");
