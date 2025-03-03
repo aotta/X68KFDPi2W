@@ -104,8 +104,7 @@ void loop() {
   
 
   unsigned short int BlinkCounter=0;
-  if (digitalRead(INTEXT)) { //poivia
-  //  if (0) {  //debug 0 force drive 0/1, 1 force drive 2/3
+    if (digitalRead(INTEXT)) {
       OPTA=OPT0;
       OPTB=OPT1;
       Serial.print("Drive 0/1");
@@ -152,7 +151,7 @@ void loop() {
 
 ////////////////// OPT 0 //////////////////
   if (!digitalReadFast(OPTA)) {
-    //Serial.print("optA");
+    //Serial.print("opt0");
 
     if (!digitalReadFast(Eject)) {   // era Eject
        digitalWriteFast(Inserted,HIGH);
@@ -177,24 +176,22 @@ void loop() {
 
     if (!DF0) {
         digitalWriteFast(Inserted,HIGH);  // for TT!!  
-    //    digitalWriteFast(FDDINT,HIGH);
-    //    digitalWriteFast(Error,HIGH);  
+        digitalWriteFast(FDDINT,HIGH);
+        digitalWriteFast(Error,HIGH);  
         digitalWriteFast(DF0_EN,LOW);
     } else {
         digitalWriteFast(Inserted,LOW);
-      //  digitalWriteFast(FDDINT,HIGH);  // not remove!! era HIGH
-      //  digitalWriteFast(Error,HIGH);  
+        digitalWriteFast(FDDINT,HIGH);  // not remove!! era HIGH
+        digitalWriteFast(Error,HIGH);  
         digitalWriteFast(DF0_EN,HIGH);
       }
-  
-  digitalWriteFast(FDDINT,HIGH);  // not remove!! era HIGH
-      
+
  }  // opt 0
 
 
 ////////////////// OPT 1 //////////////////
  if (!digitalReadFast(OPTB)) {
-   // Serial.print("optB");
+   // Serial.print("opt1");
    
     if (!(digitalReadFast(Eject))) { // era eject
       Serial.print("Ej 1-"); 
@@ -218,20 +215,18 @@ void loop() {
       }   
 
     if (!DF1) {
-       digitalWriteFast(Inserted,HIGH);  // for TT!!  
-     //   digitalWriteFast(FDDINT,HIGH);  //NOT REMOVE FOR EJECT DRIVE LOW!!!
-     //   digitalWriteFast(Error,HIGH);  
+        digitalWriteFast(Inserted,HIGH);  // for TT!!  
+        digitalWriteFast(FDDINT,HIGH);  //NOT REMOVE FOR EJECT DRIVE LOW!!!
+        digitalWriteFast(Error,HIGH);  
         digitalWriteFast(DF1_EN,LOW);
       } else {
         digitalWriteFast(Inserted,LOW);
-      //  digitalWriteFast(FDDINT,HIGH);  // not remove!! era HIGH
-      //  digitalWriteFast(Error,HIGH);
+        digitalWriteFast(FDDINT,HIGH);  // not remove!! era HIGH
+        digitalWriteFast(Error,HIGH);
         digitalWriteFast(DF1_EN,HIGH);  
       }
-    
-    digitalWriteFast(FDDINT,HIGH);  // not remove!! era HIGH
-   
-  } //optB
+
+  } //opt1
 
   if (!DF0) {
         digitalWriteFast(LEDFD0,LOW);
