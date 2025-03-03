@@ -8,6 +8,8 @@ Writing to floppy is not supported yes (may be in future...)
 
 A special thanks to Adafruit team for their great "Floppy library", from wich i starded for floppy emulation part.
 
+**NOTE** Working on a fix for conflicts found when using both an internal and an external X68KFDPi2W for 4 floppy emulation... stay tuned!
+
 ![ScreenShot](https://raw.githubusercontent.com/aotta/X68KFDPi2W/main/pictures/X68KFDIPi2W_Board.jpg)
 ![ScreenShot](https://raw.githubusercontent.com/aotta/X68KFDPi2W/main/pictures/X68KFDIPi2W_HFE.jpg)
 ![ScreenShot](https://raw.githubusercontent.com/aotta/X68KFDPi2W/main/pictures/X68KFDIPi2W_LED.jpg)
