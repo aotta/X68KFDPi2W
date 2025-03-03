@@ -10,6 +10,7 @@ A special thanks to Adafruit team for their great "Floppy library", from wich i 
 
 **NOTE** Last revision fix a conflicts found when using both an internal and an external X68KFDPi2W for 4 floppy emulation, now disabled 74LVC245 when drives not enabled. 
 Please use last PCB, X68KFDPico.u2f and X68KFDPi2W.u2f version!!
+**NOTE 2** Some games need tricks to properly boot, for example A-JAX works when starting with both drive off (leds off). 
 
 ![ScreenShot](https://raw.githubusercontent.com/aotta/X68KFDPi2W/main/pictures/X68KFDIPi2W_Board.jpg)
 ![ScreenShot](https://raw.githubusercontent.com/aotta/X68KFDPi2W/main/pictures/X68KFDIPi2W_HFE.jpg)
