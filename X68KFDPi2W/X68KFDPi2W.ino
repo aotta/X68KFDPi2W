@@ -1196,7 +1196,7 @@ void loop() {
   }
    //auto enabled = true;
   curtrack0=trackno0;curtrack1=trackno1;  
-     
+       
   if (!enabled0) { 
     fluxout0 = -1; cached_trackno0 = -1; new_trackno0=0;trackno0=0;
     //Serial.println("flushed 0 .......");
@@ -1308,16 +1308,17 @@ void loop() {
   //digitalWrite(READY_PIN, !motor_pin); 
  
   //digitalWrite(READY_PIN, !((enabled0)||(enabled1)));
-  
+    
   if ((enabled0)||(enabled1)) {
   //if ((inserted0)||(inserted1)) {
-      pinMode(READY_PIN,OUTPUT);
+      //pinMode(READY_PIN,OUTPUT);
       digitalWrite(READY_PIN, LOW);
       digitalWrite(LVC245_EN, HIGH); // Output when HIGH
     } else {
-      pinMode(READY_PIN,INPUT);
-      digitalWrite(LVC245_EN, LOW); // Output when HIGH
+     // pinMode(READY_PIN,INPUT);
+     digitalWrite(LVC245_EN, LOW); // Output when HIGH
     }
+      
   
   //digitalWrite(READY_PIN, !((enabled1 && inserted1)||(enabled0&& inserted0)));
   //digitalWrite(READY_PIN, !((!digitalRead(SELECT_PINA))||(!digitalRead(SELECT_PINB))));
