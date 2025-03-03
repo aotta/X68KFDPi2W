@@ -22,25 +22,26 @@ bool HFE0_On=false,HFE1_On=false;
 #include <StreamString.h>
 
 #define DENSITY_PIN    0  // IDC 2
-#define SELECT_PIN3    1  // DRIVE SELECT DS3
+#define SELECT_PIN3    1  // IDC 6  DRIVE SELECT DS3
 #define INDEX_PIN      2  // IDC 8   // output from PicoFloppy
-#define SELECT_PIN0    3  // IDC 12  // DRIVE SELECT DS0
-#define SELECT_PIN1    4  // DRIVE SELECT DS1
-#define SELECT_PIN2    5  // DRIVE SELECT DS2
+#define SELECT_PIN0    3  // IDC 10 DRIVE SELECT DS0
+#define SELECT_PIN1    4  // IDC 12 DRIVE SELECT DS1
+#define SELECT_PIN2    5  // IDC 14 DRIVE SELECT DS2
 #define MOTOR_PIN      6  // IDC 16
 #define DIR_PIN        7  // IDC 18
 #define STEP_PIN       8  // IDC 20
 #define WRDATA_PIN     9  // IDC 22 //input for reading from PC when writing SD
 #define WRGATE_PIN    10  // IDC 24 // input for writing on disk
 #define TRK0_PIN      11  // IDC 26 // output from PicoFloppy
-#define PROT_PIN      12  // IDC 28  // output from PicoFloppy
+#define PROT_PIN      12  // IDC 28 // output from PicoFloppy
 #define READ_PIN      13  // IDC 30 // output from PicoFloppy
 #define SIDE_PIN      14  // IDC 32
 #define READY_PIN     15  // IDC 34  // output from PicoFloppy
 #define BUZZER_PIN    20  // Output pin for sound
-#define DF0_EN        21  // Set D20 as Button FD1 Read strobe from internal floppy
-#define DF1_EN        22  // Set D20 as Button FD1 Read strobe from internal floppy
-#define INTEXT        26  // Set D20 as Button FD1 Read strobe from internal floppy
+#define DF0_EN        21  // Info for drive A enabled from other PICO
+#define DF1_EN        22  // Info for drive B enabled from other PICO
+#define INTEXT        26  // Read from jumper - FD0-1 when HIGH, FD2-3 when LOW
+#define LVC245_EN     27  // Enable output to FD bus when HIGH
 
 
 char ssid[40];
@@ -52,6 +53,7 @@ int curtrack1=0;
 bool subdirOn=false;
 bool refreshOn=false;
 int SELECT_PINA, SELECT_PINB;
+int numdrv0,numdrv1;
 
 // SDCARD_SS_PIN is defined for the built-in SD on some boards.
 #ifndef SDCARD_SS_PIN
@@ -118,7 +120,7 @@ const int led = LED_BUILTIN;
 #include "mfm_impl.h"
 
 enum {
-  max_flux_bits = 166667 // 300RPM (200ms rotational time), 1us bit times era 200000 //poivia
+  max_flux_bits = 166667 // 300RPM (200ms rotational time), 1us bit times era 200000  
 };
 enum { max_flux_count_long = (max_flux_bits + 31) / 32 };
 
@@ -218,11 +220,26 @@ void setup1() {
 void __not_in_flash_func(loop1)() {
 //  static bool once;
 
+  if ((fluxin0 >= 0)&&(!digitalRead(WRGATE_PIN))) {
+ 
+    pio_sm_put_blocking(pio, sm_index_pulse,
+                        2000); //  put index high for 2ms (out of 200ms)  
+    for (size_t i = 0; i < flux_count_long; i++) {
+      int f = fluxin0;
+      if (f < 0)
+        break;
+      uint32_t wd = pio_sm_get_blocking(pio, sm_fluxout);
+      flux_datain0[fluxin0][i]=wd;
+      }
+    // terminate index pulse if ongoing
+    pio_sm_exec(pio, sm_index_pulse,
+                0 | offset_index_pulse); // JMP to the first instruction
+  }
   if ((fluxout0 >= 0)&&(!digitalRead(SELECT_PINA))) {
  
     pio_sm_put_blocking(pio, sm_index_pulse,
-                        2000); // era 4000 ??? put index high for 4ms (out of 200ms) poivia
-    for (size_t i = 0; i < flux_count_long; i++) {
+                        2000); // put index high for 2ms (out of 200ms)  
+                        for (size_t i = 0; i < flux_count_long; i++) {
       int f = fluxout0;
       if (f < 0)
         break;
@@ -235,9 +252,9 @@ void __not_in_flash_func(loop1)() {
   }
   
     
-  if ((fluxout1 >= 0)&& (!digitalRead(SELECT_PIN1))) {
+  if ((fluxout1 >= 0)&& (!digitalRead(SELECT_PINB))) {
     pio_sm_put_blocking(pio, sm_index_pulse,
-                        2000); // era 4000 ??? put index high for 4ms (out of 200ms) poivia
+                        2000); //  put index high for 2ms (out of 200ms) 
     for (size_t i = 0; i < flux_count_long; i++) {
       int f = fluxout1;
       if (f < 0)
@@ -271,8 +288,8 @@ uint8_t track_data1[track_max_bytes];
 
 void onStep() {
   
-  if ((!digitalRead(SELECT_PIN1))) {
-    auto enabled1 = !digitalRead(SELECT_PIN1); // motor need not be enabled to seek tracks
+  if ((!digitalRead(SELECT_PINB))) {
+    auto enabled1 = !digitalRead(SELECT_PINB); // motor need not be enabled to seek tracks
     auto direction = digitalRead(DIR_PIN);
     int new_track1 = trackno1;
     if (direction) {
@@ -281,7 +298,7 @@ void onStep() {
         tone(BUZZER_PIN, NOTE_G4, 250);
         noTone(BUZZER_PIN);
     } else {
-    if (new_track1 < 79)
+    if (new_track1 < 77)
       new_track1++;
       tone(BUZZER_PIN, NOTE_F7, 250);
       noTone(BUZZER_PIN);
@@ -303,7 +320,7 @@ void onStep() {
         tone(BUZZER_PIN, NOTE_G4, 250);
         noTone(BUZZER_PIN);
     } else {
-      if (new_track0 < 79)
+      if (new_track0 < 77)
       new_track0++;
       tone(BUZZER_PIN, NOTE_F7, 250);
       noTone(BUZZER_PIN);
@@ -329,7 +346,6 @@ bool setFormat(size_t size) {
     auto img_size = (size_t)i.sectors * i.cylinders * i.sides * (128 << i.n);
    // Serial.println("  ");
    // Serial.printf("sec/cyl/side/n: %d %d %d %d \n",(size_t)i.sectors,i.cylinders,i.sides,i.n);
-   // if  (size==1261568) size=1228800; //poivia
      if (size != img_size)
       continue;
     cur_format = &i;
@@ -415,21 +431,21 @@ void get_HFE_track1() {
 
 void writeTRK() {
       uint8_t decod_data[16];
-      digitalWrite(READY_PIN,LOW);
-      //pio_sm_put_blocking(pio, sm_index_pulse,2000); // era 4000 ??? put index high for 4ms (out of 200ms) poivia
-      for (size_t i = 0; i < flux_count_long; i++) {
+      //digitalWrite(READY_PIN,LOW);
+      pio_sm_put_blocking(pio, sm_index_pulse,2000); // put index high for 2ms (out of 200ms) 
+      //for (size_t i = 0; i < flux_count_long; i++) {
+      while (!digitalRead(WRGATE_PIN)) { int i=0;
          //uint32_t d=__builtin_bswap32(pio_sm_get_blocking(pio, sm_fluxin));
          uint32_t d=(pio_sm_get_blocking(pio, sm_fluxin));
-         flux_datain0[0][i]=d;
-         for (int j = 0; j < 16; j++) { // Estrai i bit di dati (ogni bit di dati è seguito da un bit di clock)
-          decod_data[j] |= (d >> (2 * j)) & 0x01;
-         }
-        for (int j = 0; j < 8; j++) {      // Combina due bit per formare un carattere ASCII
-        char c = (decod_data[2 * j] << 1) | decod_data[2 * j + 1];
-        Serial.print(c);
-        }
-        
-        
+         Serial.print(d,HEX);
+         //flux_datain0[0][i]=d;
+           //for (int j = 0; j < 16; j++) { // Estrai i bit di dati (ogni bit di dati è seguito da un bit di clock)
+         // decod_data[j] |= (d >> (2 * j)) & 0x01;
+         //}
+        //for (int j = 0; j < 8; j++) {      // Combina due bit per formare un carattere ASCII
+        //char c = (decod_data[2 * j] << 1) | decod_data[2 * j + 1];
+        //Serial.print(c,HEX);
+        //}
        }
       /* 
       int sector_count = cur_format->sectors;
@@ -456,7 +472,7 @@ void openFile0() {
     char path[512];
     strcpy(path,curDir);
     strcat(path,filename0);
-    auto res0 = file0.open(path); //poivia
+    auto res0 = file0.open(path);  
     if (!res0) {
       Serial.print("*********** open error in file:");
       Serial.println(path);
@@ -476,7 +492,7 @@ void openFile1() {
     char path[512];
     strcpy(path,curDir);
     strcat(path,filename1);
-     auto res1 = file1.open(path); //poivia
+     auto res1 = file1.open(path); 
      if (!res1) {
       Serial.print("*********** open error in file:");
       Serial.println(path);
@@ -509,11 +525,11 @@ void handleRoot() {
   temp.printf("<title>X68KFDPi2</title>\
     <style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style></head>\
     <body><h1>X68KFDPi2 by Andrea Ottaviani - v.1.0 (02/2025)</h1>\
-    <div style='display: inline-block;'><form action='./eject0'style='display: inline;'>Drive 0: %s   ->trk: %d <input type='submit' value='Eject' ></form>\
+    <div style='display: inline-block;'><form action='./eject0'style='display: inline;'>Drive %d: %s   ->trk: %d <input type='submit' value='Eject' ></form>\
     <form action='./default0' style='display: inline;'><input type='submit' value='Make default' ></form> \
-    <br><div style='display: inline-block;'><form action='./eject1'style='display: inline;'>Drive 1: %s   ->trk: %d <input type='submit' value='Eject' ></form> \
+    <br><div style='display: inline-block;'><form action='./eject1'style='display: inline;'>Drive %d: %s   ->trk: %d <input type='submit' value='Eject' ></form> \
    <form action='./default1' style='display: inline;'><input type='submit' value='Make default' ></form> </div>\
-    <p>Current directory: ==== %s ====</p></form>",filename0,curtrack0,filename1,curtrack1,curDir);
+    <p>Current directory: ==== %s ====</p></form>",numdrv0,filename0,curtrack0,numdrv1,filename1,curtrack1,curDir);
   temp.printf("<form action='./refresh'><label for='refresh'>Auto refresh page (5s):</label><select id='refresh' name='refresh'>");
   if (refreshOn) {
     temp.printf("<option value='ON'>ON</option><option value='OFF'>OFF</option></select><input type='submit'></form>");
@@ -606,7 +622,7 @@ int readRiga(File32 &file, char *buffer, size_t bufferSize) {
 
 void handleDefault0() {
     file2.close();
-    auto res = file2.open("wifi.cfg"); //poivia
+    auto res = file2.open("wifi.cfg");  
     SD.remove("tmp.cfg");
     tempfile.open("tmp.cfg",O_CREAT | O_WRITE);
     
@@ -644,7 +660,7 @@ void handleDefault0() {
     file2.close();
     tempfile.close();
     SD.remove("wifi.cfg");
-    file2.open("wifi.cfg",O_CREAT | O_WRITE); //poivia
+    file2.open("wifi.cfg",O_CREAT | O_WRITE); 
     res=tempfile.open("tmp.cfg",O_READ);
     if (!res) {
       Serial.println("Error open tmp.cfg");
@@ -665,7 +681,7 @@ void handleDefault0() {
 
 void handleDefault1() {
      file2.close();
-    auto res = file2.open("wifi.cfg"); //poivia
+    auto res = file2.open("wifi.cfg");  
     SD.remove("tmp.cfg");
     tempfile.open("tmp.cfg",O_CREAT | O_WRITE);
     
@@ -705,7 +721,7 @@ void handleDefault1() {
     file2.close();
     tempfile.close();
     SD.remove("wifi.cfg");
-    file2.open("wifi.cfg",O_CREAT | O_WRITE); //poivia
+    file2.open("wifi.cfg",O_CREAT | O_WRITE);  
     res=tempfile.open("tmp.cfg",O_READ);
     if (!res) {
       Serial.println("Error open tmp.cfg");
@@ -801,26 +817,34 @@ void setup() {
   digitalWrite(PROT_PIN, HIGH); // active low
   pinMode(DF0_EN, INPUT);
   pinMode(DF1_EN, INPUT);
-  pinMode(INTEXT,INPUT);
+  pinMode(INTEXT,INPUT_PULLUP);
+  pinMode(LVC245_EN,OUTPUT);
+  digitalWrite(LVC245_EN, HIGH); // Output when HIGH
+ 
   
   memset(filename0,0,sizeof(filename0));
   memset(filename1,0,sizeof(filename1)); 
  
    early_setup_done = true;
 
+Serial.begin(115200);
+ 
 #if defined(WAIT_SERIAL)
- Serial.begin(115200);
   while (!Serial) {
   }
   Serial.println("Serial connected");
 #endif
-if (!digitalRead(INTEXT)) {
+delay(200);
+if (digitalRead(INTEXT)) { //poivia
+//if (0) { //poivia
      SELECT_PINA=SELECT_PIN0;
      SELECT_PINB=SELECT_PIN1;
+     numdrv0=0;numdrv1=1;
      Serial.println("Drive 0/1");
   } else {
      SELECT_PINA=SELECT_PIN2;
      SELECT_PINB=SELECT_PIN3;
+     numdrv0=2;numdrv1=3;
      Serial.println("Drive 2/3");
   }  
 attachInterrupt(digitalPinToInterrupt(STEP_PIN), onStep, FALLING);
@@ -837,7 +861,7 @@ if (!SD.begin(SD_CONFIG)) {
   }
   setFormat(1261568);
   
-    auto res = file2.open("wifi.cfg"); //poivia
+    auto res = file2.open("wifi.cfg");  
     
     if (!res) {
         Serial.println("No wifi.cfg found, using default..");
@@ -882,8 +906,8 @@ if (!SD.begin(SD_CONFIG)) {
     }
 
   WiFi.mode(WIFI_STA);
-  Serial.print(ssid);Serial.println("*"); //poivia
-  Serial.print(password);Serial.println("*"); //poivia
+  //Serial.print(ssid);Serial.println("*"); 
+  //Serial.print(password);Serial.println("*");  
   WiFi.begin(ssid, password);
   Serial.println("");
 
@@ -1049,8 +1073,7 @@ static void encode_track0(uint8_t head, uint8_t cylinder) {
   };
   size_t pos = encode_track_mfm(&io);
   //Serial.printf("Encode head %d track %d \n",head,cylinder);
-  //rfor (int i=0;i<4888;i++) {Serial.print(i);Serial.print("-");Serial.print(flux_data0[head][i],HEX);Serial.print("-");} //poivia
- // Serial.printf("\nEncoded0 to %zu flux\n", pos);
+   
 }
 
 static void encode_track1(uint8_t head, uint8_t cylinder) {
@@ -1158,13 +1181,19 @@ void loop() {
   int inserted1 = digitalRead(DF1_EN);
   int side = !digitalRead(SIDE_PIN);
 
-  auto enabled0 = (motor_pin && select_pin0); //poivia
+  auto enabled0 = (motor_pin && select_pin0);  
   auto enabled1 = (motor_pin && select_pin1);
   if (!filename0[0]) enabled0=0;
   if (!filename1[0]) enabled1=0;
 
   writeon0 = (enabled0 && !digitalRead(WRGATE_PIN));
-  if (writeon0) Serial.println("Write ON ++++");
+  if (writeon0) {
+    Serial.println("Write ON ++++");
+    for (size_t i = 0; i < flux_count_long; i++) {
+      //uint32_t d=__builtin_bswap32(pio_sm_get_blocking(pio, sm_fluxin));
+      Serial.print(flux_datain0[0][i],HEX);
+    }     
+  }
    //auto enabled = true;
   curtrack0=trackno0;curtrack1=trackno1;  
      
@@ -1216,7 +1245,7 @@ void loop() {
 
   if ((cur_format && new_trackno0 != cached_trackno0) &&(enabled0)) {
     fluxout0 = -1;
-    //Serial.printf("Preparing flux0 data for track %d\n", new_trackno0);
+    Serial.printf("Preparing flux0 data for track %d\n", new_trackno0);
     int sector_count = cur_format->sectors;
     int side_count = cur_format->sides;
     int sector_size = 128 << cur_format->n;
@@ -1246,7 +1275,7 @@ void loop() {
   
   if ((cur_format && new_trackno1 != cached_trackno1)&&(enabled1)) {
     fluxout1 = -1;
-    //Serial.printf("------------->Preparing flux1 data for track %d\n", new_trackno1); 
+    Serial.printf("------------->Preparing flux1 data for track %d\n", new_trackno1); 
     int sector_count = cur_format->sectors;
     int side_count = cur_format->sides;
     int sector_size = 128 << cur_format->n;
@@ -1277,17 +1306,23 @@ void loop() {
   // computer, just leaving the pin HIGH works, while immediately reporting LOW
   // on the "ready / disk change:
   //digitalWrite(READY_PIN, !motor_pin); 
-  digitalWrite(READY_PIN, !((enabled1)||(enabled0)));
-  //digitalWrite(READY_PIN, !((inserted0)||(inserted1)));
+ 
+  //digitalWrite(READY_PIN, !((enabled0)||(enabled1)));
+  
+  if ((enabled0)||(enabled1)) {
+  //if ((inserted0)||(inserted1)) {
+      pinMode(READY_PIN,OUTPUT);
+      digitalWrite(READY_PIN, LOW);
+      digitalWrite(LVC245_EN, HIGH); // Output when HIGH
+    } else {
+      pinMode(READY_PIN,INPUT);
+      digitalWrite(LVC245_EN, LOW); // Output when HIGH
+    }
+  
   //digitalWrite(READY_PIN, !((enabled1 && inserted1)||(enabled0&& inserted0)));
   //digitalWrite(READY_PIN, !((!digitalRead(SELECT_PINA))||(!digitalRead(SELECT_PINB))));
   //digitalWrite(READY_PIN,LOW);
- /*if ((fluxout0+fluxout1)>=-1) {
-    digitalWrite(READY_PIN,LOW);
-  } else {
-    digitalWrite(READY_PIN,HIGH);
-  }
-  */
+ 
   server.handleClient();
   server.client();
   MDNS.update();
