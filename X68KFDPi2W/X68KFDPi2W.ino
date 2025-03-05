@@ -218,23 +218,24 @@ void setup1() {
 }
 
 void __not_in_flash_func(loop1)() {
-//  static bool once;
-
-  if ((fluxin0 >= 0)&&(!digitalRead(WRGATE_PIN))) {
- 
-    pio_sm_put_blocking(pio, sm_index_pulse,
+  static bool once;
+/*
+  if (fluxin0 >= 0) {
+    Serial.print("leggo");
+     pio_sm_put_blocking(pio, sm_index_pulse,
                         2000); //  put index high for 2ms (out of 200ms)  
     for (size_t i = 0; i < flux_count_long; i++) {
       int f = fluxin0;
       if (f < 0)
         break;
-      uint32_t wd = pio_sm_get_blocking(pio, sm_fluxout);
+      uint32_t wd = pio_sm_get_blocking(pio, sm_fluxin);
       flux_datain0[fluxin0][i]=wd;
       }
     // terminate index pulse if ongoing
     pio_sm_exec(pio, sm_index_pulse,
                 0 | offset_index_pulse); // JMP to the first instruction
   }
+*/
   if ((fluxout0 >= 0)&&(!digitalRead(SELECT_PINA))) {
  
     pio_sm_put_blocking(pio, sm_index_pulse,
@@ -428,40 +429,46 @@ void get_HFE_track1() {
 }
 
 
-
 void writeTRK() {
-      uint8_t decod_data[16];
-      //digitalWrite(READY_PIN,LOW);
-      pio_sm_put_blocking(pio, sm_index_pulse,2000); // put index high for 2ms (out of 200ms) 
-      //for (size_t i = 0; i < flux_count_long; i++) {
-      while (!digitalRead(WRGATE_PIN)) { int i=0;
-         //uint32_t d=__builtin_bswap32(pio_sm_get_blocking(pio, sm_fluxin));
-         uint32_t d=(pio_sm_get_blocking(pio, sm_fluxin));
-         Serial.print(d,HEX);
-         //flux_datain0[0][i]=d;
-           //for (int j = 0; j < 16; j++) { // Estrai i bit di dati (ogni bit di dati è seguito da un bit di clock)
-         // decod_data[j] |= (d >> (2 * j)) & 0x01;
-         //}
-        //for (int j = 0; j < 8; j++) {      // Combina due bit per formare un carattere ASCII
-        //char c = (decod_data[2 * j] << 1) | decod_data[2 * j + 1];
-        //Serial.print(c,HEX);
-        //}
-       }
-      /* 
+      digitalWrite(READY_PIN,LOW);
+       digitalWrite(LVC245_EN,HIGH);
+    // Serial.println("Start Write>>>>>>>");
+      fluxout0=-1;fluxout1=-1;
+     pio_sm_put_blocking(pio, sm_index_pulse,
+                        2000); //  put index high for 2ms (out of 200ms)  
+    //for (size_t i = 0; i < flux_count_long; i++) {
+    int nflux=0;
+    while(!digitalRead(WRGATE_PIN)) { 
+     // int f = fluxin0;
+     // if (f < 0)
+     //   break;
+      uint32_t wd = pio_sm_get_blocking(pio, sm_fluxin);
+      if (nflux>=40)flux_datain0[0][nflux-40]=__builtin_bswap32(wd);
+      nflux++;
+    }
+    
+    // terminate index pulse if ongoing
+    pio_sm_exec(pio, sm_index_pulse,
+                0 | offset_index_pulse); // JMP to the first instruction
+    
+    //digitalWrite(LVC245_EN,LOW);
+    Serial.printf("\n flux len %d\n",nflux);
+    for (size_t i = 0; i < nflux; i++) {
+      Serial.print(flux_datain0[0][i],HEX);
+    }
       int sector_count = cur_format->sectors;
       int side_count = cur_format->sides;
       int sector_size = 128 << cur_format->n;
       size_t offset = sector_size * sector_count * side_count * trackno0;
       size_t count = sector_size * sector_count;
       int dummy_byte = trackno0 * side_count;
-      for (auto side = 0; side < side_count; side++) {
-        for (int i=0;i<flux_count_long;i++) {
-          uint32_t data=flux_datain0[fluxin0][i];
-          Serial.print(data,HEX);
-        }
-        decode_track0(side, trackno0);
-      } */
-      //digitalWrite(READY_PIN,HIGH);
+      decode_track0(0, trackno0);
+        
+// terminate index pulse if ongoing
+    Serial.println("<<<<<<<<<<<<End Write");
+    fluxin0=-1;
+    writeon0=0;
+    //digitalWrite(READY_PIN,HIGH);
     
 }
 
@@ -469,6 +476,7 @@ void openFile0() {
   bool rewound = false;
     file0.close();
     fluxout0 = -1; 
+    fluxin0 = -1;
     char path[512];
     strcpy(path,curDir);
     strcat(path,filename0);
@@ -745,6 +753,7 @@ void handleEject0() {
     memset(filename0,0,sizeof(filename0));
     file0.close(); 
     fluxout0=-1;
+    fluxin0=-1;
     server.send(200,"text/html",ejback);
    digitalWrite(led, 0);
 }
@@ -836,7 +845,7 @@ Serial.begin(115200);
 #endif
 delay(200);
 if (digitalRead(INTEXT)) { //poivia
-//if (0) { //poivia
+//if (0) { //poivia debug: 1 to force drive 0/1, 0 for drive 2/3
      SELECT_PINA=SELECT_PIN0;
      SELECT_PINB=SELECT_PIN1;
      numdrv0=0;numdrv1=1;
@@ -852,7 +861,10 @@ attachInterrupt(digitalPinToInterrupt(STEP_PIN), onStep, FALLING);
 
 if (!SD.begin(SD_CONFIG)) {
     Serial.println("SD card initialization failed");
-    delay(2000);
+    while(1) {
+      digitalWrite(led, 1);delay(800);
+      digitalWrite(led, 0);delay(300);
+    }
   } else if (!dir.open("/")) {
     Serial.println("SD card directory could not be read");
     delay(2000);
@@ -1185,20 +1197,20 @@ void loop() {
   auto enabled1 = (motor_pin && select_pin1);
   if (!filename0[0]) enabled0=0;
   if (!filename1[0]) enabled1=0;
-
+  
+  
   writeon0 = (enabled0 && !digitalRead(WRGATE_PIN));
   if (writeon0) {
+    writeTRK();
     Serial.println("Write ON ++++");
-    for (size_t i = 0; i < flux_count_long; i++) {
-      //uint32_t d=__builtin_bswap32(pio_sm_get_blocking(pio, sm_fluxin));
-      Serial.print(flux_datain0[0][i],HEX);
-    }     
   }
+    
    //auto enabled = true;
   curtrack0=trackno0;curtrack1=trackno1;  
        
   if (!enabled0) { 
     fluxout0 = -1; cached_trackno0 = -1; new_trackno0=0;trackno0=0;
+    fluxin0 = -1;
     //Serial.println("flushed 0 .......");
     } // poivia
   if (!enabled1) { 
@@ -1245,7 +1257,8 @@ void loop() {
 
   if ((cur_format && new_trackno0 != cached_trackno0) &&(enabled0)) {
     fluxout0 = -1;
-    Serial.printf("Preparing flux0 data for track %d\n", new_trackno0);
+    fluxin0 = -1;
+    //Serial.printf("Preparing flux0 data for track %d\n", new_trackno0);
     int sector_count = cur_format->sectors;
     int side_count = cur_format->sides;
     int sector_size = 128 << cur_format->n;
@@ -1271,11 +1284,11 @@ void loop() {
   } 
   fluxout0 =
       (cur_format != NULL && enabled0 && cached_trackno0 == trackno0) ? side : -1;
-  fluxin0=fluxout0;
+  //fluxin0=fluxout0;
   
   if ((cur_format && new_trackno1 != cached_trackno1)&&(enabled1)) {
     fluxout1 = -1;
-    Serial.printf("------------->Preparing flux1 data for track %d\n", new_trackno1); 
+    //Serial.printf("------------->Preparing flux1 data for track %d\n", new_trackno1); 
     int sector_count = cur_format->sectors;
     int side_count = cur_format->sides;
     int sector_size = 128 << cur_format->n;
@@ -1306,11 +1319,9 @@ void loop() {
   // computer, just leaving the pin HIGH works, while immediately reporting LOW
   // on the "ready / disk change:
   //digitalWrite(READY_PIN, !motor_pin); 
- 
-  //digitalWrite(READY_PIN, !((enabled0)||(enabled1)));
-    
-  if ((enabled0)||(enabled1)) {
-  //if ((inserted0)||(inserted1)) {
+   
+  //if ((enabled0)||(enabled1)) {
+  if ((inserted0)||(inserted1)) {
       //pinMode(READY_PIN,OUTPUT);
       digitalWrite(READY_PIN, LOW);
       digitalWrite(LVC245_EN, HIGH); // Output when HIGH
@@ -1318,12 +1329,7 @@ void loop() {
      // pinMode(READY_PIN,INPUT);
      digitalWrite(LVC245_EN, LOW); // Output when HIGH
     }
-      
-  
-  //digitalWrite(READY_PIN, !((enabled1 && inserted1)||(enabled0&& inserted0)));
-  //digitalWrite(READY_PIN, !((!digitalRead(SELECT_PINA))||(!digitalRead(SELECT_PINB))));
-  //digitalWrite(READY_PIN,LOW);
- 
+       
   server.handleClient();
   server.client();
   MDNS.update();
