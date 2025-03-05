@@ -236,7 +236,8 @@ void __not_in_flash_func(loop1)() {
                 0 | offset_index_pulse); // JMP to the first instruction
   }
 */
-  if ((fluxout0 >= 0)&&(!digitalRead(SELECT_PINA))) {
+  //if ((fluxout0 >= 0)&&(!digitalRead(SELECT_PINA))) {
+  if ((fluxout0 >= 0)) {
  
     pio_sm_put_blocking(pio, sm_index_pulse,
                         2000); // put index high for 2ms (out of 200ms)  
@@ -253,7 +254,8 @@ void __not_in_flash_func(loop1)() {
   }
   
     
-  if ((fluxout1 >= 0)&& (!digitalRead(SELECT_PINB))) {
+  //if ((fluxout1 >= 0)&& (!digitalRead(SELECT_PINB))) {
+  if ((fluxout1 >= 0)) {
     pio_sm_put_blocking(pio, sm_index_pulse,
                         2000); //  put index high for 2ms (out of 200ms) 
     for (size_t i = 0; i < flux_count_long; i++) {
@@ -1201,8 +1203,8 @@ void loop() {
   
   writeon0 = (enabled0 && !digitalRead(WRGATE_PIN));
   if (writeon0) {
-    writeTRK();
-    Serial.println("Write ON ++++");
+   // writeTRK();
+   // Serial.println("Write ON ++++");
   }
     
    //auto enabled = true;
@@ -1216,8 +1218,8 @@ void loop() {
   if (!enabled1) { 
     fluxout1 = -1; cached_trackno1 = -1; new_trackno1=0;trackno1=0;
     //Serial.println("flushed 1 .......");
-    } // poivia
-  
+    } 
+   //poivia
   static bool old_enabled0 = false, old_enabled1 = false, old_select_pin0 = false,
               old_select_pin1 = false, old_motor_pin = false;
   static bool old_inserted0 = false, old_inserted1 = false;
