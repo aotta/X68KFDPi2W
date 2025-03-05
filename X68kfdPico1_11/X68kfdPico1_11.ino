@@ -102,6 +102,9 @@ void loop() {
   unsigned char OPTA;
   unsigned char OPTB;
   
+  digitalWriteFast(LED_FD0_RED,LOW);
+  digitalWriteFast(LED_FD1_RED,LOW);
+      
 
   unsigned short int BlinkCounter=0;
     if (digitalRead(INTEXT)) {
@@ -179,11 +182,13 @@ void loop() {
         digitalWriteFast(FDDINT,HIGH);
         digitalWriteFast(Error,HIGH);  
         digitalWriteFast(DF0_EN,LOW);
+        digitalWrite(LED_FD0_RED,LOW);
     } else {
         digitalWriteFast(Inserted,LOW);
         digitalWriteFast(FDDINT,HIGH);  // not remove!! era HIGH
         digitalWriteFast(Error,HIGH);  
         digitalWriteFast(DF0_EN,HIGH);
+        if (!digitalRead(Motor)) digitalWrite(LED_FD0_RED,HIGH);
       }
 
  }  // opt 0
@@ -219,11 +224,13 @@ void loop() {
         digitalWriteFast(FDDINT,HIGH);  //NOT REMOVE FOR EJECT DRIVE LOW!!!
         digitalWriteFast(Error,HIGH);  
         digitalWriteFast(DF1_EN,LOW);
+        digitalWrite(LED_FD1_RED,LOW);
       } else {
         digitalWriteFast(Inserted,LOW);
         digitalWriteFast(FDDINT,HIGH);  // not remove!! era HIGH
         digitalWriteFast(Error,HIGH);
         digitalWriteFast(DF1_EN,HIGH);  
+        if (!digitalRead(Motor)) digitalWrite(LED_FD1_RED,HIGH);
       }
 
   } //opt1
@@ -238,10 +245,11 @@ void loop() {
   if (!DF1) {
         digitalWriteFast(LEDFD1,LOW);
         digitalWriteFast(BT_FD1_INT,LOW);
+        digitalWrite(LED_FD1_RED,LOW);
       } else {
          digitalWriteFast(LEDFD1,HIGH);
          digitalWriteFast(BT_FD1_INT,HIGH);
-      }
+       }
 
   if (bitBlink0) {
        delay(10);
@@ -260,7 +268,10 @@ void loop() {
         digitalWriteFast(LEDFD1,HIGH);
       }
     }
-
+  if (digitalRead(Motor)) {
+    digitalWrite(LED_FD0_RED,LOW);
+    digitalWrite(LED_FD1_RED,LOW); 
+  }
  } //while
  
 }
