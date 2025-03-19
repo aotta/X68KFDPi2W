@@ -105,9 +105,13 @@ void loop() {
   digitalWriteFast(LED_FD0_RED,LOW);
   digitalWriteFast(LED_FD1_RED,LOW);
       
-
-  unsigned short int BlinkCounter=0;
+  digitalWrite(Inserted,HIGH);
+  digitalWrite(DF0_EN,LOW);
+  digitalWrite(DF1_EN,LOW);
+  
+  unsigned int BlinkCounter=0;
     if (digitalRead(INTEXT)) {
+    //if(1) { //(1) to force drive 0/1 - use (0) to force drive 2/3
       OPTA=OPT0;
       OPTB=OPT1;
       Serial.print("Drive 0/1");
@@ -120,10 +124,12 @@ void loop() {
 
   // put your main code here, to run repeatedly:
   Serial.println("Start");
-  
+
+
   while(1) {
+
     BlinkCounter++;
-    if (BlinkCounter>=29999) BlinkCounter=0;
+    if (BlinkCounter>=200000) BlinkCounter=0;
     
     if (digitalRead(BT_FD0)) {
         digitalWrite(FDDINT,LOW);
@@ -135,7 +141,7 @@ void loop() {
         digitalWrite(INTLED,LOW);
          }
     Serial.print("DF0:");Serial.println(DF0);
-    delay(200);
+    delay(300);
     }
    
   if (digitalRead(BT_FD1)) {
@@ -145,10 +151,10 @@ void loop() {
         } else {
         bitBlink1=0;
         DF1=1;
-           digitalWrite(INTLED,LOW);
+        digitalWrite(INTLED,LOW);
        }
     Serial.print("DF1:");Serial.println(DF1);
-    delay(200);
+    delay(300);
     }
    
 
@@ -161,19 +167,22 @@ void loop() {
        DF0=0;
        digitalWriteFast(FDDINT,LOW);  // not remove!! era HIGH     
        Serial.println("Ej 0-");
+       digitalWrite(DF0_EN,LOW);
        delay(4);
        digitalWrite(INTLED,HIGH);
-    }    
+       digitalWriteFast(LED_FD0_RED,LOW);
+   }    
     
     if (!digitalReadFast(EjectMSK)) {
         digitalWriteFast(LED_FD0_RED,HIGH);
         digitalWriteFast(LEDFD0,LOW);
         Serial.println("EjMSK 0-");
     } else {
-        digitalWriteFast(LED_FD0_RED,LOW);  
+    //    digitalWriteFast(LED_FD0_RED,LOW);  
     }
 
     if (!digitalReadFast(LED_BLINK)) {
+      //  Serial.println("blink 0-");
        bitBlink0=1;
       }   
 
@@ -188,6 +197,7 @@ void loop() {
         digitalWriteFast(FDDINT,HIGH);  // not remove!! era HIGH
         digitalWriteFast(Error,HIGH);  
         digitalWriteFast(DF0_EN,HIGH);
+        bitBlink0=0;
         if (!digitalRead(Motor)) digitalWrite(LED_FD0_RED,HIGH);
       }
 
@@ -203,8 +213,10 @@ void loop() {
       digitalWriteFast(Inserted,HIGH);   
       digitalWriteFast(FDDINT,LOW);  // not remove!! era HIGH
       DF1=0;
+      digitalWrite(DF1_EN,LOW);
       delay(4);
       digitalWrite(INTLED,HIGH);
+      digitalWriteFast(LED_FD1_RED,LOW);
     }
       
     if (!digitalReadFast(EjectMSK)) {
@@ -212,11 +224,12 @@ void loop() {
       digitalWriteFast(LEDFD1,LOW);
       Serial.print("EjMSK 1-");
       } else {
-        digitalWriteFast(LED_FD1_RED,LOW);  
+     //   digitalWriteFast(LED_FD1_RED,LOW);  
     }
 
     if (!digitalReadFast(LED_BLINK)) {
-       bitBlink1=1;
+     // Serial.println("blink 1-");
+      bitBlink1=1;
       }   
 
     if (!DF1) {
@@ -230,6 +243,7 @@ void loop() {
         digitalWriteFast(FDDINT,HIGH);  // not remove!! era HIGH
         digitalWriteFast(Error,HIGH);
         digitalWriteFast(DF1_EN,HIGH);  
+        bitBlink1=0;
         if (!digitalRead(Motor)) digitalWrite(LED_FD1_RED,HIGH);
       }
 
@@ -252,26 +266,31 @@ void loop() {
        }
 
   if (bitBlink0) {
-       delay(10);
-      if (BlinkCounter>=3000) {
-        digitalWriteFast(LEDFD0,LOW);
-      } else {
-        digitalWriteFast(LEDFD0,HIGH);
-      }
+    //   delay(6);
+      if (BlinkCounter>=34000) {
+        //Serial.print(".");
+        digitalWrite(LEDFD0,LOW);
+        digitalWrite(BT_FD0_INT,LOW);
+       } else {
+        digitalWrite(LEDFD0,HIGH);
+        digitalWrite(BT_FD0_INT,HIGH);
+       }
     }
   if (bitBlink1) {
       //Serial.print("b1"); // do not remove, needed for timing
-       delay(10);
-    if (BlinkCounter>=3000) {
+    if (BlinkCounter>=60000) {
         digitalWriteFast(LEDFD1,LOW);
-      } else {
+        digitalWriteFast(BT_FD1_INT,LOW);
+       } else {
         digitalWriteFast(LEDFD1,HIGH);
+         digitalWriteFast(BT_FD1_INT,HIGH);
       }
     }
-  if (digitalRead(Motor)) {
-    digitalWrite(LED_FD0_RED,LOW);
-    digitalWrite(LED_FD1_RED,LOW); 
-  }
- } //while
+    if (digitalRead(Motor)) {
+      digitalWrite(LED_FD0_RED,LOW);
+      digitalWrite(LED_FD1_RED,LOW); 
+    }
+  digitalWrite(Inserted,LOW); //for 2HDboot
+  } //while
  
 }
