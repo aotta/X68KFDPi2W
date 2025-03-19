@@ -440,12 +440,13 @@ void writeTRK() {
                         2000); //  put index high for 2ms (out of 200ms)  
     //for (size_t i = 0; i < flux_count_long; i++) {
     int nflux=0;
+    while (digitalRead(WRDATA_PIN));
     while(!digitalRead(WRGATE_PIN)) { 
      // int f = fluxin0;
      // if (f < 0)
      //   break;
       uint32_t wd = pio_sm_get_blocking(pio, sm_fluxin);
-      if (nflux>=40)flux_datain0[0][nflux-40]=__builtin_bswap32(wd);
+      flux_datain0[0][nflux]=__builtin_bswap32(wd);
       nflux++;
     }
     
@@ -469,7 +470,6 @@ void writeTRK() {
 // terminate index pulse if ongoing
     Serial.println("<<<<<<<<<<<<End Write");
     fluxin0=-1;
-    writeon0=0;
     //digitalWrite(READY_PIN,HIGH);
     
 }
@@ -828,7 +828,7 @@ void setup() {
   digitalWrite(PROT_PIN, HIGH); // active low
   pinMode(DF0_EN, INPUT);
   pinMode(DF1_EN, INPUT);
-  pinMode(INTEXT,INPUT_PULLUP);
+  pinMode(INTEXT,INPUT);
   pinMode(LVC245_EN,OUTPUT);
   digitalWrite(LVC245_EN, HIGH); // Output when HIGH
  
@@ -847,7 +847,7 @@ Serial.begin(115200);
 #endif
 delay(200);
 if (digitalRead(INTEXT)) { //poivia
-//if (0) { //poivia debug: 1 to force drive 0/1, 0 for drive 2/3
+//if (1) { //poivia debug: 1 to force drive 0/1, 0 for drive 2/3
      SELECT_PINA=SELECT_PIN0;
      SELECT_PINB=SELECT_PIN1;
      numdrv0=0;numdrv1=1;
@@ -863,9 +863,11 @@ attachInterrupt(digitalPinToInterrupt(STEP_PIN), onStep, FALLING);
 
 if (!SD.begin(SD_CONFIG)) {
     Serial.println("SD card initialization failed");
-    while(1) {
+    int j=0;
+    while(j<10) {
       digitalWrite(led, 1);delay(800);
       digitalWrite(led, 0);delay(300);
+      j++;
     }
   } else if (!dir.open("/")) {
     Serial.println("SD card directory could not be read");
@@ -879,7 +881,7 @@ if (!SD.begin(SD_CONFIG)) {
     
     if (!res) {
         Serial.println("No wifi.cfg found, using default..");
-        return;
+        //poivia return;
       }
     char buf[255];
     int pos;
@@ -918,15 +920,16 @@ if (!SD.begin(SD_CONFIG)) {
       openFile1();
       Serial.printf("Default file1: %s\n",filename1);
     }
-
+  Serial.println("Starting WIFI:");
   WiFi.mode(WIFI_STA);
-  //Serial.print(ssid);Serial.println("*"); 
-  //Serial.print(password);Serial.println("*");  
+  Serial.print(ssid);Serial.println("*"); 
+  Serial.print(password);Serial.println("*");  
   WiFi.begin(ssid, password);
-  Serial.println("");
+  Serial.println("-");
 
   // Wait for connection
   #ifdef WAIT_WIFI
+  Serial.println("wait for wifi connection");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
@@ -1201,10 +1204,10 @@ void loop() {
   if (!filename1[0]) enabled1=0;
   
   
-  writeon0 = (enabled0 && !digitalRead(WRGATE_PIN));
+  writeon0 = (!digitalRead(WRGATE_PIN));
   if (writeon0) {
-   // writeTRK();
-   // Serial.println("Write ON ++++");
+    writeTRK();
+    Serial.println("Write ON ++++");
   }
     
    //auto enabled = true;
