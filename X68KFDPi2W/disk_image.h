@@ -63,6 +63,7 @@ struct img_t {
                                  // sector of cylinder 0)
   const char *fmt_name;          // shown on the web page
   uint32_t d88_hdr_end;          // IMG_D88: end of the track table
+  uint8_t d88_cyls;              // IMG_D88: cylinders with data
   img_side_t side[2];            // sectors of the sides currently loaded
 };
 
@@ -104,6 +105,8 @@ template <class F> bool img_open(img_t &im, F &f, const char *name) {
       uint32_t off = img_le32(o);
       if (off && off < hdr_end)
         hdr_end = off;
+      if (off)
+        im.d88_cyls = t / 2 + 1;
       if ((uint32_t)(0x20 + 4 * (t + 1)) >= hdr_end)
         break;
     }
