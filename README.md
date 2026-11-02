@@ -25,7 +25,7 @@ Writing to floppy images is supported: the X68000 can copy files, format disks (
 
 ### Web interface
 
-![ScreenShot](https://raw.githubusercontent.com/aotta/X68KFDPi2W/main/pictures/X68KFDIPi2W_WEB.jpg)
+![ScreenShot](https://raw.githubusercontent.com/aotta/X68KFDPi2W/main/pictures/X68KFDIPi2W_WEB2.jpg)
 
 - Live status of the two drives (activity/write LED, track, R/W or read only, image format), updated every second.
 - One click insert in drive 0 or 1 for every image in the folder; folders are listed first.
