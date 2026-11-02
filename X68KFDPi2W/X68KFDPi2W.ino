@@ -1263,8 +1263,7 @@ Serial.begin(115200);
   Serial.println("Serial connected");
 #endif
 delay(200);
-//if (digitalRead(INTEXT)) { //poivia
-if (1) { //poivia debug: 1 to force drive 0/1, 0 for drive 2/3
+if (digitalRead(INTEXT)) { // jumper: HIGH = drives 0/1, LOW = drives 2/3
      SELECT_PINA=SELECT_PIN0;
      SELECT_PINB=SELECT_PIN1;
      numdrv0=0;numdrv1=1;
