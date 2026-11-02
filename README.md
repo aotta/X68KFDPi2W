@@ -36,6 +36,8 @@ Writing to floppy images is supported: the X68000 can copy files, format disks (
 
 - `DEBUG_BUS` (default 0): 1 prints MOTOR / DRIVE SELECT changes on the serial port (verbose).
 - `RESET_ON_DESELECT` (default 1): the head goes back to track 0 when the drive is deselected or the motor stops. Needed by games that ask to swap disks (e.g. A-JAX).
+- `BUS_ON_INSERTED` (default 0): READY and the bus outputs (74LVC245) are active only while an emulated drive is in use (motor on and drive selected), as in the 03/2025 release. With 1 they follow the disk inserted signals, and some games (e.g. Dracula) hang after loading Human68k.
+- `READY_FOLLOWS_MOTOR`, `DF_EN_PULLDOWN`, `TRK0_FOLLOWS_SELECT` (default 0): experimental behaviours, off.
 
 ### Building the firmware
 

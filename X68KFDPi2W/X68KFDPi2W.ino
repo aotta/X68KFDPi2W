@@ -18,6 +18,16 @@
 // 0 = like a real drive: head position and track data are kept, and the reset
 // to track 0 happens only when the disk is changed from the web page.
 #define RESET_ON_DESELECT 1 // reset is needed by A-Jax and others games for change disk detection
+
+// Experiments of 01/2026 ("poivia"), off = behaviour of the 03/2025 release.
+// With both at 1 Dracula hangs after loading Human68k.
+#define READY_FOLLOWS_MOTOR 0 // 1 = READY = !motor at every loop
+#define DF_EN_PULLDOWN 0      // 1 = pull-down on the DF0_EN/DF1_EN inputs
+#define BUS_ON_INSERTED 0     // 1 = READY and bus outputs (74LVC245) on while a
+                              // disk is inserted (DF0_EN/DF1_EN); 0 = only while
+                              // an emulated drive is enabled (motor + select)
+#define TRK0_FOLLOWS_SELECT 0 // 1 = TRACK 0 output updated for the selected drive
+                              // at every loop; 0 = updated at every step only
 bool HFE0_On=false,HFE1_On=false;   
 
 #include <hardware/clocks.h>
@@ -224,6 +234,9 @@ struct {
 } wr_sess;
 
 bool wr_allowed0 = false, wr_allowed1 = false;
+// highest head position of each drive: 77 as in the 03/2025 release, more
+// only for images with more than 78 cylinders
+volatile int max_track[2] = {77, 77};
 img_t img[2]; // format and sector layout of the image in each drive
 bool img_err0 = false, img_err1 = false; // image could not be opened
 uint32_t wr_last_ms[2] = {0, 0}; // last write per drive (web page LED)
@@ -406,11 +419,17 @@ static void __not_in_flash_func(send_revolution)(int drive) {
 }
 
 void __not_in_flash_func(loop1)() {
-  if (fluxout0 >= 0)
+  bool sent = false;
+  // start a revolution only while the drive is still selected (03/2025)
+  if (fluxout0 >= 0 && !gpio_get(SELECT_PINA)) {
     send_revolution(0);
-  if (fluxout1 >= 0)
+    sent = true;
+  }
+  if (fluxout1 >= 0 && !gpio_get(SELECT_PINB)) {
     send_revolution(1);
-  if (fluxout0 < 0 && fluxout1 < 0)
+    sent = true;
+  }
+  if (!sent)
     wr_poll(-1, -1, -1);
 }
 
@@ -442,7 +461,7 @@ void onStep() {
         tone(BUZZER_PIN, NOTE_G4, 250);
         noTone(BUZZER_PIN);
     } else {
-    if (new_track1 < 81) // 2HD drives: about 82 positions
+    if (new_track1 < max_track[1])
       new_track1++;
       tone(BUZZER_PIN, NOTE_F7, 250);
       noTone(BUZZER_PIN);
@@ -464,7 +483,7 @@ void onStep() {
         tone(BUZZER_PIN, NOTE_G4, 250);
         noTone(BUZZER_PIN);
     } else {
-      if (new_track0 < 81) // 2HD drives: about 82 positions
+      if (new_track0 < max_track[0])
       new_track0++;
       tone(BUZZER_PIN, NOTE_F7, 250);
       noTone(BUZZER_PIN);
@@ -623,6 +642,9 @@ static void openDrive(int d) {
     Serial.printf("HFE%d On\n", d);
   }
   allowed = !hfe && f.isWritable() && !img[d].wp;
+  int cyls = img[d].type == IMG_RAW ? img[d].geom.cyls
+           : img[d].type == IMG_D88 ? img[d].d88_cyls : 0;
+  max_track[d] = cyls > 78 ? (cyls > 82 ? 81 : cyls - 1) : 77;
   Serial.printf("opened %d: %s [%s] %s\n", d, path, imageTypeName(d),
                 allowed ? "(R/W)" : "(read only)");
 }
@@ -1243,9 +1265,14 @@ void setup() {
   pinMode(PROT_PIN, OUTPUT);  
   digitalWrite(READY_PIN, HIGH); // active low
   digitalWrite(PROT_PIN, HIGH); // active low
+#if DF_EN_PULLDOWN
   pinMode(DF0_EN, INPUT_PULLDOWN);
   pinMode(DF1_EN, INPUT_PULLDOWN);
-  pinMode(INTEXT,INPUT);
+#else
+  pinMode(DF0_EN, INPUT);
+  pinMode(DF1_EN, INPUT);
+#endif
+  pinMode(INTEXT,INPUT_PULLUP);
   pinMode(LVC245_EN,OUTPUT);
   digitalWrite(LVC245_EN, HIGH); // Output when HIGH
  
@@ -1745,9 +1772,11 @@ void loop() {
   else if (select_pin1 && filename1[0]) wprot = !wr_allowed1;
   digitalWrite(PROT_PIN, wprot ? LOW : HIGH);
 
+#if TRK0_FOLLOWS_SELECT
   // TRACK 0 of the selected drive (active LOW): each drive has its own head
   if (select_pin0) digitalWrite(TRK0_PIN, trackno0 != 0);
   else if (select_pin1) digitalWrite(TRK0_PIN, trackno1 != 0);
+#endif
     
    //auto enabled = true;
   curtrack0=trackno0;curtrack1=trackno1;
@@ -1810,10 +1839,15 @@ void loop() {
   // computer, just leaving the pin HIGH works, while immediately reporting LOW
   // on the "ready / disk change:
   
+#if READY_FOLLOWS_MOTOR
   digitalWrite(READY_PIN, !motor_pin); //poivia
+#endif
    
-  //if ((enabled0)||(enabled1)) {
+#if BUS_ON_INSERTED
   if ((inserted0)||(inserted1)) {
+#else
+  if ((enabled0)||(enabled1)) { // 03/2025: bus released when no drive is in use
+#endif
       //pinMode(READY_PIN,OUTPUT);
       digitalWrite(READY_PIN, LOW);
       digitalWrite(LVC245_EN, HIGH); // Output when HIGH
