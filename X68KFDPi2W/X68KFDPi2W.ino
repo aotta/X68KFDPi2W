@@ -6,12 +6,28 @@
 
 //#define WAIT_SERIAL
 //#define WAIT_WIFI
+
+// 1 = print every change of MOTOR / DRIVE SELECT on the serial port (very
+// verbose: the X68000 selects and deselects the drives continuously)
+#define DEBUG_BUS 0
+
+// 1 = when a drive is deselected or the motor stops, the head goes back to
+// track 0 and the track is read again from the SD at the next access.
+// Needed by games that ask to swap disks (e.g. A-Jax): with 0 they report a
+// disk change a few seconds after the request, even with no new disk.
+// 0 = like a real drive: head position and track data are kept, and the reset
+// to track 0 happens only when the disk is changed from the web page.
+#define RESET_ON_DESELECT 1 // reset is needed by A-Jax and others games for change disk detection
 bool HFE0_On=false,HFE1_On=false;   
 
+#include <hardware/clocks.h>
+#include <hardware/dma.h>
+#include <hardware/pio.h>
 #include "drive.pio.h"
 
 #include "SdFat.h"
 #include "pitches.h"
+#include "logo.h"
 // SD_FAT_TYPE = 0 for SdFat/File as defined in SdFatConfig.h,
 // 1 for FAT16/FAT32, 2 for exFAT, 3 for FAT16/FAT32 and exFAT.
 #define SD_FAT_TYPE 1
@@ -48,6 +64,8 @@ char ssid[40];
 char password[40];
 char filename0[128];
 char filename1[128];
+char default0[128] = "";   // image loaded at boot (wifi.cfg), "" = empty drive
+char default1[128] = "";
 int curtrack0=0;
 int curtrack1=0;
 bool subdirOn=false;
@@ -110,7 +128,8 @@ char curDir[512]="/";
 WebServer server(80);
 const int led = LED_BUILTIN;
 
-#define DEBUG_PRINTF(...) Serial.printf(__VA_ARGS__)
+// Adafruit library debug output ("mark @ ..."): change to Serial.printf(__VA_ARGS__) to enable
+#define DEBUG_PRINTF(...) ((void)0)
 #define DEBUG_ASSERT(x)                                                        \
   do {                                                                         \
     if (!(x)) {                                                                \
@@ -118,6 +137,8 @@ const int led = LED_BUILTIN;
     }                                                                          \
   } while (0)
 #include "mfm_impl.h"
+#define IMG_LOG(...) Serial.printf(__VA_ARGS__)
+#include "disk_image.h"
 
 enum {
   max_flux_bits = 166667 // 300RPM (200ms rotational time), 1us bit times era 200000  
@@ -129,6 +150,9 @@ volatile int fluxout0; // side number 0/1 or -1 if no flux should be generated
 volatile int fluxin0; // side number 0/1 or -1 if no flux should be generated
 volatile int fluxout1; // side number 0/1 or -1 if no flux should be generated
 volatile int fluxin1; // side number 0/1 or -1 if no flux should be generated
+// Set via IRQ so must be volatile
+volatile int trackno0;
+volatile int trackno1;
 volatile size_t flux_count_long =
     max_flux_count_long; // in units of uint32_ts (longs)
 volatile uint32_t flux_data0[2]
@@ -137,11 +161,75 @@ volatile uint32_t flux_data0[2]
 volatile uint32_t flux_data1[2]
                            [max_flux_count_long]; // one track of flux data for
                                                   // both sides of the disk
-volatile uint32_t flux_datain0[2]
-                           [max_flux_count_long]; // one track of flux data for
-                                                  // both sides of the disk
-volatile int wrote0=0;
-volatile int writeon0=0;
+
+/////////////////////////////////////////////////////////////////////////////
+// Write support
+//
+// WRDATA is captured by the PIO program "fluxin_capture", which measures the
+// time between falling edges, and by a DMA channel that copies one byte per
+// flux transition into wr_pulses[]. The DMA is always armed, so capture does
+// not depend on how quickly core 0 reacts (WiFi, web server...).
+//
+// Core 1, which generates the read flux, polls WRGATE once per 32-bit word
+// (every 32us at 500 kbit/s). Each time WRGATE is asserted and released it
+// queues a "segment" with: drive, side, track, rotational position at the
+// start of the write and the [start, end) range inside wr_pulses[].
+//
+// Core 0 (loop) decodes the segments with the mfm_impl.h routines, copies the
+// valid sectors into the track buffer, re-encodes the track flux (so a
+// verify read returns the new data straight away) and saves the track to the
+// SD card when the write session ends (step, side/drive change, motor off,
+// or WR_IDLE_MS without writes).
+/////////////////////////////////////////////////////////////////////////////
+
+// Same RAM previously used by flux_datain0[2][max_flux_count_long]
+// (41672 bytes), minus the 1KB of the temporary sector buffer.
+enum { WR_BUF_SIZE = 2 * max_flux_count_long * 4 - 1024 };
+uint8_t wr_pulses[WR_BUF_SIZE] __attribute__((aligned(4)));
+uint8_t wr_sector_tmp[1024];
+
+// Capture clock: one count every 1/24us (PIO at 48MHz, 2 cycles per count)
+#define FLUXIN_COUNT_HZ 24000000.0f
+#define FLUXIN_OVERHEAD 2 // fixed cycles of the PIO loop, in counts
+// Words still in the PIO TX FIFO/OSR when core 1 sees WRGATE (5 x 32us)
+#define WR_POS_LATENCY_WORDS 5
+#define WR_IDLE_MS 100
+#define WR_QUEUE_LEN 16
+
+struct wr_segment_t {
+  int8_t drive;   // 0/1, -1 = write meant for a drive not emulated here
+  int8_t side;
+  uint8_t track;
+  bool overflow;  // the capture buffer filled up before WRGATE was released
+  int32_t pos;    // word index of the read flux when WRGATE fell, -1 = unknown
+  uint32_t start, end; // range inside wr_pulses[]
+  uint32_t limit;       // end of the buffer area available to this write
+};
+
+wr_segment_t wr_queue[WR_QUEUE_LEN];
+volatile uint32_t wr_head = 0;       // written by core 1 only
+volatile uint32_t wr_tail = 0;       // written by core 0 only, after a segment
+                                     // has been fully processed
+volatile bool wr_capture_ready = false;
+volatile uint32_t wr_dropped = 0;
+int wr_dma_chan = -1;
+
+// Write session in progress (core 0 only)
+struct {
+  bool active;
+  int drive, track, side;
+  uint32_t dirty; // bitmap of written sectors
+  uint32_t last_ms;
+  bool need_encode; // read flux not yet regenerated
+} wr_sess;
+
+bool wr_allowed0 = false, wr_allowed1 = false;
+img_t img[2]; // format and sector layout of the image in each drive
+bool img_err0 = false, img_err1 = false; // image could not be opened
+uint32_t wr_last_ms[2] = {0, 0}; // last write per drive (web page LED)
+// Track whose flux is currently in flux_data0/1 (-1 = none)
+volatile int cached_trackno0 = -1;
+volatile int cached_trackno1 = -1;
 
 struct floppy_format_info_t {
   uint8_t cylinders, sectors, sides; // number of sides may be 1 or 2
@@ -217,58 +305,113 @@ void setup1() {
   }
 }
 
-void __not_in_flash_func(loop1)() {
-  static bool once;
-/*
-  if (fluxin0 >= 0) {
-    Serial.print("leggo");
-     pio_sm_put_blocking(pio, sm_index_pulse,
-                        2000); //  put index high for 2ms (out of 200ms)  
-    for (size_t i = 0; i < flux_count_long; i++) {
-      int f = fluxin0;
-      if (f < 0)
-        break;
-      uint32_t wd = pio_sm_get_blocking(pio, sm_fluxin);
-      flux_datain0[fluxin0][i]=wd;
-      }
-    // terminate index pulse if ongoing
-    pio_sm_exec(pio, sm_index_pulse,
-                0 | offset_index_pulse); // JMP to the first instruction
-  }
-*/
-  //if ((fluxout0 >= 0)&&(!digitalRead(SELECT_PINA))) {
-  if ((fluxout0 >= 0)) {
- 
-    pio_sm_put_blocking(pio, sm_index_pulse,
-                        2000); // put index high for 2ms (out of 200ms)  
-                        for (size_t i = 0; i < flux_count_long; i++) {
-      int f = fluxout0;
-      if (f < 0)
-        break;
-      auto d = flux_data0[fluxout0][i];
-      pio_sm_put_blocking(pio, sm_fluxout, __builtin_bswap32(d));
-      }
-    // terminate index pulse if ongoing
-    pio_sm_exec(pio, sm_index_pulse,
-                0 | offset_index_pulse); // JMP to the first instruction
-  }
-  
-    
-  //if ((fluxout1 >= 0)&& (!digitalRead(SELECT_PINB))) {
-  if ((fluxout1 >= 0)) {
-    pio_sm_put_blocking(pio, sm_index_pulse,
-                        2000); //  put index high for 2ms (out of 200ms) 
-    for (size_t i = 0; i < flux_count_long; i++) {
-      int f = fluxout1;
-      if (f < 0)
-        break;
-      auto d = flux_data1[fluxout1][i];
-      pio_sm_put_blocking(pio, sm_fluxout, __builtin_bswap32(d));
+static inline uint32_t wr_dma_index() {
+  return (uint32_t)((uint8_t *)dma_hw->ch[wr_dma_chan].write_addr - wr_pulses);
+}
+
+// Restart the capture at wr_pulses[pos], with room up to wr_pulses[limit]
+// (core 1 only)
+static uint32_t wr_limit = WR_BUF_SIZE;
+static void __not_in_flash_func(wr_rewind)(uint32_t pos, uint32_t limit) {
+  dma_channel_abort(wr_dma_chan);
+  pio_sm_set_enabled(pio, sm_fluxin, false);
+  pio_sm_clear_fifos(pio, sm_fluxin);
+  pio_sm_restart(pio, sm_fluxin);
+  pio_sm_exec(pio, sm_fluxin, pio_encode_jmp(offset_fluxin));
+  dma_channel_set_write_addr(wr_dma_chan, wr_pulses + pos, false);
+  dma_channel_set_trans_count(wr_dma_chan, limit - pos, true);
+  wr_limit = limit;
+  pio_sm_set_enabled(pio, sm_fluxin, true);
+}
+
+// Called by core 1 for every flux word sent (and continuously when idle).
+// out_drive/out_side/out_pos describe what is being sent right now.
+static void __not_in_flash_func(wr_poll)(int out_drive, int out_side, int out_pos) {
+  static bool open = false;
+  static wr_segment_t *seg;
+  if (!wr_capture_ready)
+    return;
+  bool gate = !gpio_get(WRGATE_PIN); // active LOW
+  if (gate && !open) {
+    if (wr_head - wr_tail >= WR_QUEUE_LEN) { // queue full: lose this write
+      wr_dropped++;
+      open = true;
+      seg = NULL;
+      return;
     }
-    // terminate index pulse if ongoing
-    pio_sm_exec(pio, sm_index_pulse,
-                0 | offset_index_pulse); // JMP to the first instruction
+    // Choose where to capture this write: right after the writes still to
+    // be decoded, or back at the beginning of the buffer if there is no room
+    // left at the end (ring). With nothing left to decode the whole buffer is
+    // available (track format). Only a few us of the 00 preamble are lost by
+    // the restart, the sync mark is intact.
+    {
+      const uint32_t room = 9000; // largest sector write (1024 bytes, all 00)
+      uint32_t lo = WR_BUF_SIZE, hi = 0;
+      for (uint32_t q = wr_tail; q != wr_head; q++) {
+        const wr_segment_t &u = wr_queue[q % WR_QUEUE_LEN];
+        if (u.start < lo) lo = u.start;
+        if (u.end > hi) hi = u.end;
+      }
+      if (wr_tail == wr_head)
+        wr_rewind(0, WR_BUF_SIZE);
+      else if (WR_BUF_SIZE - hi >= room)
+        wr_rewind(hi, WR_BUF_SIZE);
+      else if (lo >= room)
+        wr_rewind(0, lo);
+      // else: no free area big enough, keep appending (may overflow)
+    }
+    seg = &wr_queue[wr_head % WR_QUEUE_LEN];
+    int drive = -1;
+    if (!gpio_get(SELECT_PINA))
+      drive = 0;
+    else if (!gpio_get(SELECT_PINB))
+      drive = 1;
+    seg->drive = drive;
+    seg->side = !gpio_get(SIDE_PIN);
+    seg->track = (drive == 1) ? trackno1 : trackno0;
+    seg->pos = (drive >= 0 && drive == out_drive && seg->side == out_side)
+                   ? out_pos
+                   : -1;
+    seg->start = wr_dma_index();
+    seg->limit = wr_limit;
+    open = true;
+  } else if (!gate && open) {
+    open = false;
+    if (seg) {
+      uint32_t end = wr_dma_index();
+      seg->end = end;
+      seg->overflow = end >= seg->limit;
+      __dmb();
+      wr_head = wr_head + 1; // publish to core 0
+    }
   }
+}
+
+static void __not_in_flash_func(send_revolution)(int drive) {
+  volatile int &fluxout = drive ? fluxout1 : fluxout0;
+  volatile uint32_t(*flux)[max_flux_count_long] = drive ? flux_data1 : flux_data0;
+  pio_sm_put_blocking(pio, sm_index_pulse,
+                      2000); // put index high for 2ms (out of 200ms)
+  for (size_t i = 0; i < flux_count_long; i++) {
+    int f = fluxout;
+    if (f < 0)
+      break;
+    auto d = flux[f][i];
+    pio_sm_put_blocking(pio, sm_fluxout, __builtin_bswap32(d));
+    wr_poll(drive, f, i);
+  }
+  // terminate index pulse if ongoing
+  pio_sm_exec(pio, sm_index_pulse,
+              0 | offset_index_pulse); // JMP to the first instruction
+}
+
+void __not_in_flash_func(loop1)() {
+  if (fluxout0 >= 0)
+    send_revolution(0);
+  if (fluxout1 >= 0)
+    send_revolution(1);
+  if (fluxout0 < 0 && fluxout1 < 0)
+    wr_poll(-1, -1, -1);
 }
 
 ////////////////////////////////////////////////
@@ -276,12 +419,10 @@ void __not_in_flash_func(loop1)() {
 // "UI", control signal handling & MFM encoding
 ////////////////////////////////////////////////
 
-// Set via IRQ so must be volatile
-volatile int trackno0;
-volatile int trackno1;
+// trackno0/trackno1 are declared at the top (also used by core 1)
 
 enum {
-  max_sector_count = 8,
+  max_sector_count = 9, // 9 x 1024: DIM 2HS/2HDE
   mfm_io_block_size = 1024,
   track_max_bytes = max_sector_count * mfm_io_block_size
 };
@@ -301,7 +442,7 @@ void onStep() {
         tone(BUZZER_PIN, NOTE_G4, 250);
         noTone(BUZZER_PIN);
     } else {
-    if (new_track1 < 77)
+    if (new_track1 < 81) // 2HD drives: about 82 positions
       new_track1++;
       tone(BUZZER_PIN, NOTE_F7, 250);
       noTone(BUZZER_PIN);
@@ -323,7 +464,7 @@ void onStep() {
         tone(BUZZER_PIN, NOTE_G4, 250);
         noTone(BUZZER_PIN);
     } else {
-      if (new_track0 < 77)
+      if (new_track0 < 81) // 2HD drives: about 82 positions
       new_track0++;
       tone(BUZZER_PIN, NOTE_F7, 250);
       noTone(BUZZER_PIN);
@@ -431,170 +572,421 @@ void get_HFE_track1() {
 }
 
 
-void writeTRK() {
-      digitalWrite(READY_PIN,LOW);
-       digitalWrite(LVC245_EN,HIGH);
-    // Serial.println("Start Write>>>>>>>");
-      fluxout0=-1;fluxout1=-1;
-     pio_sm_put_blocking(pio, sm_index_pulse,
-                        2000); //  put index high for 2ms (out of 200ms)  
-    //for (size_t i = 0; i < flux_count_long; i++) {
-    int nflux=0;
-    while (digitalRead(WRDATA_PIN));
-    while(!digitalRead(WRGATE_PIN)) { 
-     // int f = fluxin0;
-     // if (f < 0)
-     //   break;
-      uint32_t wd = pio_sm_get_blocking(pio, sm_fluxin);
-      flux_datain0[0][nflux]=__builtin_bswap32(wd);
-      nflux++;
-    }
-    
-    // terminate index pulse if ongoing
-    pio_sm_exec(pio, sm_index_pulse,
-                0 | offset_index_pulse); // JMP to the first instruction
-    
-    //digitalWrite(LVC245_EN,LOW);
-    Serial.printf("\n flux len %d\n",nflux);
-    for (size_t i = 0; i < nflux; i++) {
-      Serial.print(flux_datain0[0][i],HEX);
-    }
-      int sector_count = cur_format->sectors;
-      int side_count = cur_format->sides;
-      int sector_size = 128 << cur_format->n;
-      size_t offset = sector_size * sector_count * side_count * trackno0;
-      size_t count = sector_size * sector_count;
-      int dummy_byte = trackno0 * side_count;
-      decode_track0(0, trackno0);
-        
-// terminate index pulse if ongoing
-    Serial.println("<<<<<<<<<<<<End Write");
-    fluxin0=-1;
-    //digitalWrite(READY_PIN,HIGH);
-    
+void wr_flush(); // defined below, near loop()
+static void wr_update_flux();
+
+// Open an image read/write when possible. HFE images stay read-only (write
+// support covers sector images only); the drive then reports write-protect.
+static bool openImage(File32 &f, const char *path, bool is_hfe) {
+  if (!is_hfe && f.open(path, O_RDWR))
+    return true;
+  return f.open(path, O_RDONLY);
 }
 
-void openFile0() {
-  bool rewound = false;
-    file0.close();
-    fluxout0 = -1; 
-    fluxin0 = -1;
-    char path[512];
-    strcpy(path,curDir);
-    strcat(path,filename0);
-    auto res0 = file0.open(path);  
-    if (!res0) {
-      Serial.print("*********** open error in file:");
-      Serial.println(path);
+// Open the image of a drive: RAW sector image (HDM, XDF...), D88 or HFE
+static const char *imageTypeName(int d) {
+  switch (img[d].type) {
+  case IMG_RAW: return img[d].fmt_name;
+  case IMG_D88: return "D88";
+  case IMG_HFE: return "HFE";
+  default: return "?";
+  }
+}
+
+static void openDrive(int d) {
+  char *fname = d ? filename1 : filename0;
+  File32 &f = d ? file1 : file0;
+  if (wr_sess.active && wr_sess.drive == d) wr_flush();
+  f.close();
+  // disk change: new flux, head back to track 0 (needed by games that ask
+  // to swap disks, e.g. A-Jax)
+  if (d) { fluxout1 = -1; cached_trackno1 = -1; trackno1 = 0; }
+  else { fluxout0 = -1; fluxin0 = -1; cached_trackno0 = -1; trackno0 = 0; }
+  bool &allowed = d ? wr_allowed1 : wr_allowed0;
+  allowed = false;
+  char path[512];
+  if (fname[0] == '/') strcpy(path, fname); // full path (normal case)
+  else { strcpy(path,curDir); strcat(path,fname); } // old wifi.cfg entries
+  bool hfe = checkExt(fname, ".HFE");
+  if (d) HFE1_On = hfe; else HFE0_On = hfe;
+  bool res = openImage(f, path, hfe);
+  if (res && f.isDirectory()) { f.close(); res = false; } // not an image
+  if (res && !img_open(img[d], f, fname)) { f.close(); res = false; } // unsupported
+  (d ? img_err1 : img_err0) = !res;
+  if (!res) {
+    Serial.print("*********** open error in file:");
+    Serial.println(path);
+    return;
+  }
+  if (hfe) {
+    if (d) get_HFE_track1(); else get_HFE_track0();
+    Serial.printf("HFE%d On\n", d);
+  }
+  allowed = !hfe && f.isWritable() && !img[d].wp;
+  Serial.printf("opened %d: %s [%s] %s\n", d, path, imageTypeName(d),
+                allowed ? "(R/W)" : "(read only)");
+}
+
+void openFile0() { openDrive(0); }
+void openFile1() { openDrive(1); }
+
+/////////////////////////////////////////////////////////////////////////////
+// Web interface
+/////////////////////////////////////////////////////////////////////////////
+
+// Disk images shown in the file list
+static bool isImageFile(const char *name) {
+  return checkExt(name, ".HDM") || checkExt(name, ".XDF") || checkExt(name, ".HFE") ||
+         checkExt(name, ".D88") || checkExt(name, ".D68") || checkExt(name, ".88D") ||
+         checkExt(name, ".DIM");
+}
+
+// Part of a path after the last '/'
+static const char *baseName(const char *path) {
+  const char *s = strrchr(path, '/');
+  return s ? s + 1 : path;
+}
+
+// Page sent in chunks: no big String in RAM, whatever the number of files
+static StreamString web_buf;
+static void webFlush() {
+  if (web_buf.length()) {
+    server.sendContent(web_buf);
+    web_buf = "";
+  }
+}
+static void webOut(const char *s) {
+  web_buf.concat(s);
+  if (web_buf.length() > 1200)
+    webFlush();
+}
+static void webHtml(const char *s) { // HTML escaped text
+  char c[2] = {0, 0};
+  for (; *s; s++) {
+    switch (*s) {
+    case '&': webOut("&amp;"); break;
+    case '<': webOut("&lt;"); break;
+    case '>': webOut("&gt;"); break;
+    case '"': webOut("&quot;"); break;
+    case '\'': webOut("&#39;"); break;
+    default: c[0] = *s; webOut(c);
+    }
+  }
+}
+static void webUrl(const char *s) { // URL encoded text (for query strings)
+  char c[4];
+  for (; *s; s++) {
+    unsigned char ch = *s;
+    if (isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+      c[0] = ch; c[1] = 0;
     } else {
-      if (checkExt(filename0,"HFE")) {
-        HFE0_On=true;
-        get_HFE_track0();
-        Serial.println("HFE0 On");
-      } 
-      Serial.print("opened 0: ");Serial.println(path);
+      snprintf(c, sizeof(c), "%%%02X", ch);
     }
+    webOut(c);
+  }
 }
-void openFile1() {
-  bool rewound = false;
-    file1.close();
-    fluxout1 = -1;     
-    char path[512];
-    strcpy(path,curDir);
-    strcat(path,filename1);
-     auto res1 = file1.open(path); 
-     if (!res1) {
-      Serial.print("*********** open error in file:");
-      Serial.println(path);
-    } else {
-      if (checkExt(filename1,"HFE")) {
-        HFE1_On=true;
-        get_HFE_track1();
-        Serial.println("HFE1 On");
-      } 
-      Serial.print("opened 1: ");Serial.println(path);
-    }
+static void webJson(const char *s) { // JSON string content
+  char c[8];
+  for (; *s; s++) {
+    unsigned char ch = *s;
+    if (ch == '"' || ch == '\\') { c[0] = '\\'; c[1] = ch; c[2] = 0; }
+    else if (ch < 0x20) snprintf(c, sizeof(c), "\\u%04x", ch);
+    else { c[0] = ch; c[1] = 0; }
+    webOut(c);
+  }
 }
 
+// After an action go back to the main page
+static void sendBack() {
+  server.sendHeader("Location", "/");
+  server.send(303, "text/plain", "");
+}
 
+// Message shown once at the top of the next page (result of an action)
+static char ui_msg[96] = "";
+static bool ui_msg_err = false;
+static void uiMessage(bool err, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(ui_msg, sizeof(ui_msg), fmt, ap);
+  va_end(ap);
+  ui_msg_err = err;
+  Serial.printf("WEB: %s\n", ui_msg);
+}
+
+// Drive status, set by loop() and read by the web page
+volatile bool ui_active0 = false, ui_active1 = false;
+
+static const char web_style[] =
+  "<style>"
+  ":root{--bg:#1d2026;--card:#2a2e36;--line:#3a3f4a;--txt:#e6e6e6;--dim:#9aa0aa;"
+  "--acc:#e8a33d;--ok:#4caf50;--ro:#d9534f;--wr:#ff5c5c}"
+  "*{box-sizing:border-box}"
+  "body{margin:0;background:var(--bg);color:var(--txt);font:15px/1.4 system-ui,Segoe UI,Arial,sans-serif}"
+  "header{padding:14px 16px;border-bottom:2px solid var(--acc);display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}"
+  "header{align-items:flex-end}header span{color:var(--dim)}"
+  ".logo{max-width:100%;height:auto;display:block}"
+  "main{max-width:960px;margin:0 auto;padding:16px}"
+  ".drives{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}"
+  ".drv{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px}"
+  ".drv h2{margin:0 0 8px;font-size:16px;display:flex;align-items:center;gap:8px}"
+  ".led{width:10px;height:10px;border-radius:50%;background:#444;display:inline-block}"
+  ".led.on{background:var(--ok);box-shadow:0 0 6px var(--ok)}.led.wr{background:var(--wr);box-shadow:0 0 6px var(--wr)}"
+  ".img{font-family:Consolas,monospace;word-break:break-all;min-height:1.4em}"
+  ".meta{color:var(--dim);font-size:13px;margin:4px 0 10px}"
+  ".tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:12px;margin-left:4px;border:1px solid}"
+  ".tag.rw{color:var(--ok)}.tag.ro{color:var(--ro)}.tag.def{color:var(--acc)}.tag.fmt{color:var(--dim)}"
+  "a.btn{display:inline-block;padding:5px 10px;border-radius:5px;background:#3a3f4a;color:var(--txt);"
+  "text-decoration:none;font-size:13px;margin:2px 4px 2px 0}a.btn:hover{background:var(--acc);color:#000}"
+  "a.btn.off{opacity:.4;pointer-events:none}"
+  ".path{margin:18px 0 8px;font-family:Consolas,monospace;color:var(--acc)}"
+  ".msg{margin:12px 0 0;padding:8px 12px;border-radius:6px;border:1px solid var(--ok);color:var(--ok)}"
+  ".msg.err{border-color:var(--ro);color:var(--ro)}"
+  ".new{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:16px 0 0}"
+  ".new span{color:var(--dim);font-size:13px}.new .hint{flex-basis:100%}"
+  ".new input,.new select,.new button{background:#3a3f4a;color:var(--txt);border:1px solid var(--line);"
+  "border-radius:5px;padding:5px 8px;font:inherit;font-size:13px}"
+  ".new input{flex:1;min-width:140px}.new button{cursor:pointer}.new button:hover{background:var(--acc);color:#000}"
+  "table{width:100%;border-collapse:collapse;background:var(--card);border-radius:8px;overflow:hidden}"
+  "td{padding:7px 10px;border-top:1px solid var(--line)}tr:first-child td{border-top:0}"
+  "td.n{word-break:break-all}td.s{color:var(--dim);white-space:nowrap;text-align:right;font-size:13px}"
+  "td.a{white-space:nowrap;text-align:right}a.dir{color:var(--acc);text-decoration:none}"
+  ".cur td{background:#33302a}.empty{color:var(--dim);padding:12px}"
+  "</style>";
+
+static void webDriveCard(int idx) {
+  const char *fname = idx ? filename1 : filename0;
+  int num = idx ? numdrv1 : numdrv0;
+  bool loaded = fname[0] != 0;
+  bool rw = idx ? wr_allowed1 : wr_allowed0;
+  char tmp[160];
+  snprintf(tmp, sizeof(tmp), "<div class='drv'><h2><span class='led' id='l%d'></span>Drive %d</h2>", idx, num);
+  webOut(tmp);
+  snprintf(tmp, sizeof(tmp), "<div class='img' id='i%d' title='", idx);
+  webOut(tmp);
+  webHtml(fname);
+  webOut("'>");
+  if (loaded) webHtml(*baseName(fname) ? baseName(fname) : fname);
+  else webOut("<span class='meta'>&lt;empty&gt;</span>");
+  webOut("</div><div class='meta'>");
+  snprintf(tmp, sizeof(tmp), "Track <span id='t%d'>%d</span>", idx, idx ? curtrack1 : curtrack0);
+  webOut(tmp);
+  if (loaded && (idx ? img_err1 : img_err0))
+    webOut("<span class='tag ro'>OPEN ERROR</span>");
+  else if (loaded) {
+    webOut(rw ? "<span class='tag rw'>R/W</span>" : "<span class='tag ro'>READ ONLY</span>");
+    webOut("<span class='tag fmt'>");
+    webOut(imageTypeName(idx));
+    webOut("</span>");
+  }
+  if (!strcmp(fname, idx ? default1 : default0))
+    webOut(loaded ? "<span class='tag def' title='Loaded at power on'>&#9733; DEFAULT</span>"
+                  : "<span class='tag def' title='Empty at power on'>&#9733; DEFAULT (empty)</span>");
+  webOut("</div>");
+  snprintf(tmp, sizeof(tmp), "<a class='btn%s' href='/eject%d'>Eject</a>", loaded ? "" : " off", idx);
+  webOut(tmp);
+  snprintf(tmp, sizeof(tmp), "<a class='btn' href='/default%d' title='%s'>Make default</a></div>", idx,
+           loaded ? "Load this disk at power on" : "Leave this drive empty at power on");
+  webOut(tmp);
+}
 
 void handleRoot() {
-  static int cnt = 0;
   digitalWrite(led, 1);
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+  web_buf = "";
+  web_buf.reserve(1400);
 
-  StreamString temp;
-  StreamString tmpfile;
-  StreamString tmpdir;
-  temp.reserve(12000); // Preallocate a large chunk to avoid memory fragmentation
-  tmpdir.reserve(8000); 
-  if (refreshOn) {
-    temp.printf("<html><head><meta http-equiv='refresh' content='5'/>");
-  } else {
-    temp.printf("<html><head>");
+  webOut("<!DOCTYPE html><html><head><meta charset='utf-8'>"
+         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+         "<title>X68KFDPi2W</title>");
+  webOut(web_style);
+  webOut("</head><body><header><img class='logo' src='/logo.png' alt='X68KFDPi2W' "
+         "width='214' height='62'><span>Andrea Ottaviani &middot; v1.1</span></header>"
+         "<main><div class='drives'>");
+  webDriveCard(0);
+  webDriveCard(1);
+  webOut("</div>");
+  if (ui_msg[0]) { // result of the last action, shown once
+    webOut(ui_msg_err ? "<div class='msg err'>" : "<div class='msg'>");
+    webHtml(ui_msg);
+    webOut("</div>");
+    ui_msg[0] = 0;
   }
-  temp.printf("<title>X68KFDPi2</title>\
-    <style>body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }</style></head>\
-    <body><h1>X68KFDPi2 by Andrea Ottaviani - v.1.0 (02/2025)</h1>\
-    <div style='display: inline-block;'><form action='./eject0'style='display: inline;'>Drive %d: %s   ->trk: %d <input type='submit' value='Eject' ></form>\
-    <form action='./default0' style='display: inline;'><input type='submit' value='Make default' ></form> \
-    <br><div style='display: inline-block;'><form action='./eject1'style='display: inline;'>Drive %d: %s   ->trk: %d <input type='submit' value='Eject' ></form> \
-   <form action='./default1' style='display: inline;'><input type='submit' value='Make default' ></form> </div>\
-    <p>Current directory: ==== %s ====</p></form>",numdrv0,filename0,curtrack0,numdrv1,filename1,curtrack1,curDir);
-  temp.printf("<form action='./refresh'><label for='refresh'>Auto refresh page (5s):</label><select id='refresh' name='refresh'>");
-  if (refreshOn) {
-    temp.printf("<option value='ON'>ON</option><option value='OFF'>OFF</option></select><input type='submit'></form>");
-  } else {
-    temp.printf("<option value='ON'>ON</option><option value='OFF'selected>OFF</option></select><input type='submit'></form>");
-  }
+  webOut("<form class='new' action='/create'><span>New disk</span>"
+         "<input name='name' maxlength='40' placeholder='name' required>"
+         "<select name='type'><option value='hdm'>.HDM</option>"
+         "<option value='d88'>.D88</option></select>"
+         "<button type='submit'>Create</button>"
+         "<span class='hint'>blank 2HD 1232KB, to be formatted on the X68000</span></form>");
+  webOut("<div class='path'>");
+  webHtml(curDir);
+  webOut("</div><table>");
+
   file2.close();
- 
   dir.close();
   dir.open(curDir);
-  int dircounter=0,filecounter=0;
+  int rows = 0;
   if (subdirOn) {
-    tmpdir.printf("<form action='./radiodirs'> <input type='radio' id='UP' name='dirlist' value='UP'><label for='UP'>[DIR UP] ..</label><br>");
-    dircounter++;
+    webOut("<tr><td class='n' colspan='3'><a class='dir' href='/radiodirs?dirlist=UP'>&#8617; ..</a></td></tr>");
+    rows++;
   }
-  while (true) {
-    file2 = dir.openNextFile();
-    if (!file2) break;
-
-    char filename[256];
-    memset(filename,0,sizeof(filename));
-    file2.getName(filename, sizeof(filename));
-    
-    if (!file2.isHidden()) {
-      if (checkExt(filename,"HDM")||checkExt(filename,"HFE")) {
-        if (filecounter==0) tmpfile=tmpfile+"<form action='./radiofiles'>";
-        tmpfile.printf(" <input type='radio' id='%s' name='filelist' value='%s'><label for='%s'>%s</label><br>",filename,filename,filename,filename);
-        filecounter++;
-      } else {
-        if (file2.isDirectory()) {
-          if (dircounter==0) tmpdir.printf("<form action='./radiodirs'>");
-          tmpdir.printf(" <input type='radio' id='%s' name='dirlist' value='%s'><label for='%s'>[DIR] %s</label><br>",filename,filename,filename,filename);
-        dircounter++;
+  // first pass: directories, second pass: disk images
+  for (int pass = 0; pass < 2; pass++) {
+    dir.rewind();
+    while (true) {
+      file2 = dir.openNextFile();
+      if (!file2) break;
+      char filename[256];
+      memset(filename, 0, sizeof(filename));
+      file2.getName(filename, sizeof(filename));
+      if (file2.isHidden()) { file2.close(); continue; }
+      bool isdir = file2.isDirectory();
+      if (pass == 0 && isdir) {
+        webOut("<tr><td class='n' colspan='3'><a class='dir' href='/radiodirs?dirlist=");
+        webUrl(filename);
+        webOut("'>&#128193; ");
+        webHtml(filename);
+        webOut("</a></td></tr>");
+        rows++;
+      } else if (pass == 1 && !isdir && isImageFile(filename)) {
+        char tmp[128];
+        bool cur = !strcmp(baseName(filename0), filename) || !strcmp(baseName(filename1), filename);
+        webOut(cur ? "<tr class='cur'><td class='n'>" : "<tr><td class='n'>");
+        webHtml(filename);
+        snprintf(tmp, sizeof(tmp), "</td><td class='s'>%lu KB</td><td class='a'>",
+                 (unsigned long)(file2.fileSize() / 1024));
+        webOut(tmp);
+        for (int d = 0; d < 2; d++) {
+          snprintf(tmp, sizeof(tmp), "<a class='btn' href='/radiofiles?drivelist=%d&amp;filelist=", d);
+          webOut(tmp);
+          webUrl(filename);
+          snprintf(tmp, sizeof(tmp), "'>&#9654; FD%d</a>", d ? numdrv1 : numdrv0);
+          webOut(tmp);
         }
+        webOut("</td></tr>");
+        rows++;
       }
-    } 
-  }  
-      
-  if (dircounter>0) { 
-    temp.concat(tmpdir);
-    temp.concat(" <input type='submit' value='Enter'></form>"); 
+      file2.close();
+    }
   }
-  if (filecounter>0) {
-    temp.concat(tmpfile);
-    temp.concat("<label for='drivelist'>Insert in drive:</label><select id='drivelist' name='drivelist'><option value='0'>Drive 0</option><option value='1'>Drive 1</option></select>");
-    temp.concat("<input type='submit' value='Insert'></form>");
-  }
-  temp.concat("</body></html>");
-  //Serial.println(temp);
-  server.send(200, "text/html", temp);
+  if (!rows)
+    webOut("<tr><td class='empty'>No disk images (.HDM .XDF .D88 .DIM .HFE) in this folder</td></tr>");
+  webOut("</table></main><script>"
+         "function u(){fetch('/status').then(r=>r.json()).then(s=>{s.d.forEach((d,i)=>{"
+         "document.getElementById('t'+i).textContent=d.t;"
+         "document.getElementById('l'+i).className='led'+(d.w?' wr':d.a?' on':'');"
+         "var e=document.getElementById('i'+i);if(e.title!=d.f)location.reload();});})"
+         ".catch(()=>{}).finally(()=>setTimeout(u,1000));}u();"
+         "</script></body></html>");
+  webFlush();
+  server.sendContent(""); // end of the chunked reply
+  web_buf = "";
   digitalWrite(led, 0);
 }
 
+// Create a blank (unformatted) 2HD 1232KB disk in the current folder:
+// .HDM = raw sector image, .D88 = D88 with 77x2x8 sectors of 1024 bytes.
+// All the data bytes are E5, like a disk not yet formatted by Human68k.
+void handleCreate() {
+  digitalWrite(led, 1);
+  // keep only safe characters, max 40, no extension typed by the user
+  char name[48];
+  size_t n = 0;
+  String req = server.arg("name");
+  for (size_t i = 0; i < req.length() && n < 40; i++) {
+    char c = req[i];
+    if (isalnum((unsigned char)c) || c == ' ' || c == '-' || c == '_' || c == '(' ||
+        c == ')' || c == '.')
+      name[n++] = c;
+  }
+  name[n] = 0;
+  while (n && (name[n - 1] == ' ' || name[n - 1] == '.')) name[--n] = 0; // trailing
+  size_t lead = strspn(name, " ."); // leading spaces/dots (hidden files, "..")
+  memmove(name, name + lead, n - lead + 1);
+  char *dot = strrchr(name, '.');
+  if (dot && (checkExt(name, ".HDM") || checkExt(name, ".D88") || checkExt(name, ".XDF")))
+    *dot = 0;
+  bool d88 = server.arg("type") == "d88";
+  char path[600];
+  snprintf(path, sizeof(path), "%s%s%s", curDir, name, d88 ? ".d88" : ".hdm");
 
-String ejback="<html><head><meta http-equiv='refresh' content='1; url=/' /><title>Ejected</title></head><body><!-- Back button link --><a href='javascript:history.back()'>Done!</a></body></html>";
+  if (!name[0]) {
+    uiMessage(true, "Invalid name");
+  } else if (wr_sess.active) {
+    uiMessage(true, "Busy writing a disk, try again");
+  } else if (SD.exists(path)) {
+    uiMessage(true, "%s already exists", baseName(path));
+  } else {
+    File32 nf;
+    const uint32_t trk_bytes = 8 * (16 + 1024);              // D88 track
+    const uint32_t size = d88 ? 0x2b0 + 154 * trk_bytes : 1261568;
+    bool ok = nf.open(path, O_RDWR | O_CREAT | O_EXCL);
+    if (ok) {
+      nf.preAllocate(size); // contiguous if possible (faster, not required)
+      uint8_t *blk = wr_sector_tmp; // 1KB, free when no write is in progress
+      if (d88) {
+        // header: name, write protect 0, media 2HD, size, track table
+        uint8_t h[0x2b0];
+        memset(h, 0, sizeof(h));
+        strncpy((char *)h, name, 16);
+        h[0x1b] = 0x20;
+        for (int i = 0; i < 4; i++) h[0x1c + i] = size >> (8 * i);
+        for (int t = 0; t < 164; t++) {
+          uint32_t off = t < 154 ? 0x2b0 + t * trk_bytes : 0;
+          for (int i = 0; i < 4; i++) h[0x20 + 4 * t + i] = off >> (8 * i);
+        }
+        ok = nf.write(h, sizeof(h)) == sizeof(h);
+        memset(blk, 0xe5, 1024);
+        for (int t = 0; t < 154 && ok; t++) {
+          for (int r = 1; r <= 8 && ok; r++) {
+            uint8_t sh[16] = {(uint8_t)(t / 2), (uint8_t)(t % 2), (uint8_t)r, 3, 8, 0,
+                              0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x04}; // size 1024
+            ok = nf.write(sh, 16) == 16 && nf.write(blk, 1024) == 1024;
+          }
+        }
+      } else {
+        memset(blk, 0xe5, 1024);
+        for (uint32_t i = 0; i < size / 1024 && ok; i++)
+          ok = nf.write(blk, 1024) == 1024;
+      }
+      ok = nf.close() && ok;
+      if (!ok) SD.remove(path); // do not leave a broken image
+    }
+    if (ok)
+      uiMessage(false, "%s created: insert it and format it on the X68000", baseName(path));
+    else
+      uiMessage(true, "Cannot create %s (SD full or write error)", baseName(path));
+  }
+  sendBack();
+  digitalWrite(led, 0);
+}
+
+// Header logo, cached by the browser
+void handleLogo() {
+  server.sendHeader("Cache-Control", "max-age=86400");
+  server.send(200, "image/png", (const char *)logo_png, logo_png_len);
+}
+
+// Live drive status for the page (JSON)
+void handleStatus() {
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  web_buf = "";
+  webOut("{\"d\":[");
+  for (int i = 0; i < 2; i++) {
+    char tmp[64];
+    bool writing = wr_last_ms[i] && millis() - wr_last_ms[i] < 1500;
+    snprintf(tmp, sizeof(tmp), "%s{\"t\":%d,\"a\":%d,\"w\":%d,\"f\":\"", i ? "," : "",
+             i ? curtrack1 : curtrack0, (int)(i ? ui_active1 : ui_active0), (int)writing);
+    webOut(tmp);
+    webJson(i ? filename1 : filename0);
+    webOut("\"}");
+  }
+  webOut("]}");
+  webFlush();
+  server.sendContent("");
+}
 
 
 // Funzione per leggere una riga da un file
@@ -637,8 +1029,10 @@ void handleDefault0() {
     tempfile.open("tmp.cfg",O_CREAT | O_WRITE);
     
     if (!res) {
-      Serial.println("wifi.cfg missing!");
-      while(1);
+      Serial.println("wifi.cfg missing: default not saved");
+      tempfile.close();
+      sendBack();
+      return;
     }
     
     char buf[255];
@@ -655,8 +1049,8 @@ void handleDefault0() {
     memset(buf,0,sizeof(buf));
     readRiga(file2,buf,sizeof(buf)); //default0
     //Serial.print("Fullpath0 letto:");Serial.print(buf);Serial.println("*");
-    if (filename0[0]!=0) strcat(fullpath,curDir);
-    strcat(fullpath,filename0);
+    strcat(fullpath,filename0); // already a full path (empty = no disk at boot)
+    strcpy(default0, filename0);
     tempfile.write(fullpath);
     tempfile.write(0x0d);
     //Serial.print("Fullpath0 scritto:");Serial.print(fullpath);Serial.println("*");
@@ -686,7 +1080,7 @@ void handleDefault0() {
     tempfile.close();
    
     
-    server.send(200,"text/html",ejback);
+    sendBack();
 }
 
 void handleDefault1() {
@@ -696,8 +1090,10 @@ void handleDefault1() {
     tempfile.open("tmp.cfg",O_CREAT | O_WRITE);
     
     if (!res) {
-      Serial.println("wifi.cfg missing!");
-      while(1);
+      Serial.println("wifi.cfg missing: default not saved");
+      tempfile.close();
+      sendBack();
+      return;
     }
     
     char buf[255];
@@ -722,8 +1118,8 @@ void handleDefault1() {
     memset(buf,0,sizeof(buf));
     readRiga(file2,buf,sizeof(buf)); //default0
     //Serial.print("Fullpath1 letto:");Serial.print(buf);Serial.println("*");
-    if (filename0[1]!=0) strcat(fullpath,curDir);
-    strcat(fullpath,filename1);
+    strcat(fullpath,filename1); // already a full path (empty = no disk at boot)
+    strcpy(default1, filename1);
     tempfile.write(fullpath);
     tempfile.write(0x0d);
     //Serial.print("Fullpath1 scritto:");Serial.print(fullpath);Serial.println("*");
@@ -747,25 +1143,33 @@ void handleDefault1() {
     tempfile.close();
    
     
-    server.send(200,"text/html",ejback);
+    sendBack();
 }
 
 void handleEject0() {
      digitalWrite(led, 1);
+    if (wr_sess.active && wr_sess.drive == 0) wr_flush();
     memset(filename0,0,sizeof(filename0));
     file0.close(); 
     fluxout0=-1;
     fluxin0=-1;
-    server.send(200,"text/html",ejback);
+    cached_trackno0=-1; trackno0=0; // disk removed
+    wr_allowed0=false;
+    img_err0=false;
+    sendBack();
    digitalWrite(led, 0);
 }
 
 void handleEject1() {
      digitalWrite(led, 1);
+     if (wr_sess.active && wr_sess.drive == 1) wr_flush();
      memset(filename1,0,sizeof(filename1));
      file1.close();
      fluxout1=-1;
-     server.send(200,"text/html",ejback);
+     cached_trackno1=-1; trackno1=0; // disk removed
+     wr_allowed1=false;
+     img_err1=false;
+     sendBack();
     digitalWrite(led, 0);
 }
 void handleNotFound() {
@@ -798,9 +1202,22 @@ void setup() {
   digitalWrite(FLOPPY_ENABLE_PIN, LOW); // do second after setting direction
 #endif
 
-  offset_fluxin = pio_add_program(pio, &fluxin_compact_program);
+  // WRDATA capture: PIO measures the flux intervals, DMA stores them
+  pinMode(FLUX_IN_PIN, INPUT_PULLUP);
+  offset_fluxin = pio_add_program(pio, &fluxin_capture_program);
   sm_fluxin = pio_claim_unused_sm(pio, true);
-  fluxin_compact_program_init(pio, sm_fluxin, offset_fluxin, FLUX_IN_PIN, 1000);
+  fluxin_capture_program_init(pio, sm_fluxin, offset_fluxin, FLUX_IN_PIN,
+                              2 * FLUXIN_COUNT_HZ);
+  wr_dma_chan = dma_claim_unused_channel(true);
+  {
+    dma_channel_config dc = dma_channel_get_default_config(wr_dma_chan);
+    channel_config_set_transfer_data_size(&dc, DMA_SIZE_8);
+    channel_config_set_read_increment(&dc, false);
+    channel_config_set_write_increment(&dc, true);
+    channel_config_set_dreq(&dc, pio_get_dreq(pio, sm_fluxin, false));
+    dma_channel_configure(wr_dma_chan, &dc, wr_pulses, &pio->rxf[sm_fluxin],
+                          WR_BUF_SIZE, true);
+  }
   
   offset_fluxout = pio_add_program(pio, &fluxout_compact_program);
   sm_fluxout = pio_claim_unused_sm(pio, true);
@@ -826,8 +1243,8 @@ void setup() {
   pinMode(PROT_PIN, OUTPUT);  
   digitalWrite(READY_PIN, HIGH); // active low
   digitalWrite(PROT_PIN, HIGH); // active low
-  pinMode(DF0_EN, INPUT);
-  pinMode(DF1_EN, INPUT);
+  pinMode(DF0_EN, INPUT_PULLDOWN);
+  pinMode(DF1_EN, INPUT_PULLDOWN);
   pinMode(INTEXT,INPUT);
   pinMode(LVC245_EN,OUTPUT);
   digitalWrite(LVC245_EN, HIGH); // Output when HIGH
@@ -846,8 +1263,8 @@ Serial.begin(115200);
   Serial.println("Serial connected");
 #endif
 delay(200);
-if (digitalRead(INTEXT)) { //poivia
-//if (1) { //poivia debug: 1 to force drive 0/1, 0 for drive 2/3
+//if (digitalRead(INTEXT)) { //poivia
+if (1) { //poivia debug: 1 to force drive 0/1, 0 for drive 2/3
      SELECT_PINA=SELECT_PIN0;
      SELECT_PINB=SELECT_PIN1;
      numdrv0=0;numdrv1=1;
@@ -859,7 +1276,7 @@ if (digitalRead(INTEXT)) { //poivia
      Serial.println("Drive 2/3");
   }  
 attachInterrupt(digitalPinToInterrupt(STEP_PIN), onStep, FALLING);
-//attachInterrupt(digitalPinToInterrupt(WRGATE_PIN), writeTRK, FALLING);
+wr_capture_ready = true; // core 1 may now watch WRGATE (SELECT_PINA/B are set)
 
 if (!SD.begin(SD_CONFIG)) {
     Serial.println("SD card initialization failed");
@@ -905,7 +1322,9 @@ if (!SD.begin(SD_CONFIG)) {
       memset(filename0,0,sizeof(filename0));
     } else {
       Serial.print("Def.file0 len:");Serial.println(pos);
+      if (pos >= (int)sizeof(filename0)) pos = sizeof(filename0) - 1;
       memcpy(filename0,buf,pos);
+      strcpy(default0, filename0);
       Serial.printf("Default file0: %s\n",filename0);
       openFile0();
     }
@@ -916,7 +1335,9 @@ if (!SD.begin(SD_CONFIG)) {
       memset(filename1,0,sizeof(filename1));
     } else {
       Serial.print("Def.file1 len:");Serial.println(pos);
+      if (pos >= (int)sizeof(filename1)) pos = sizeof(filename1) - 1;
       memcpy(filename1,buf,pos);
+      strcpy(default1, filename1);
       openFile1();
       Serial.printf("Default file1: %s\n",filename1);
     }
@@ -958,6 +1379,9 @@ if (!SD.begin(SD_CONFIG)) {
   server.on("/radiofiles",handleFilelist);
   server.on("/radiodirs",handleDirlist);
   server.on("/refresh",handleRefresh);  
+  server.on("/status",handleStatus);
+  server.on("/logo.png",handleLogo);
+  server.on("/create",handleCreate);
   
   server.onNotFound(handleNotFound);
   server.begin();
@@ -975,9 +1399,18 @@ void handleFilelist() {
     Serial.println(server.argName(i) + ": " + server.arg(i));
   }
   */
-  String sfilename= server.arg(0);
-  //Serial.println(sfilename);
-  String sdrive=server.arg(1);
+  // full path of the image: the default drive setting stays valid even
+  // after moving to another folder in the browser
+  String sfilename = String(curDir) + server.arg("filelist");
+  String sdrive = server.arg("drivelist");
+  Serial.printf("WEB insert: uri=%s args=%d drivelist='%s' filelist='%s'\n",
+                server.uri().c_str(), server.args(), sdrive.c_str(),
+                server.arg("filelist").c_str());
+  if (server.arg("filelist").length() == 0) { // nothing selected
+    sendBack();
+    digitalWrite(led, 0);
+    return;
+  }
   //Serial.println(sdrive);
   char drive[2];
   sdrive.toCharArray(drive,2);
@@ -994,7 +1427,7 @@ void handleFilelist() {
   //Serial.print("Drive:");Serial.println(drive);
   //Serial.print("file0:");Serial.println(filename0);
   //Serial.print("file1:");Serial.println(filename1);
-  server.send(200, "text/html", ejback);
+  sendBack();
   digitalWrite(led, 0);
 }
 
@@ -1002,7 +1435,7 @@ void handleDirlist() {
 
   digitalWrite(led, 1);
 
-  String sdirname= server.arg(0);
+  String sdirname= server.arg("dirlist");
   char dirname[256];
   sdirname.toCharArray(dirname,256);
   Serial.println(dirname);
@@ -1029,7 +1462,7 @@ void handleDirlist() {
   
   Serial.print("New path:");Serial.println(curDir);
 
-  server.send(200, "text/html", ejback);
+  sendBack();
   digitalWrite(led, 0);
 }
 
@@ -1044,9 +1477,8 @@ void handleRefresh() {
   }
   */
   String srefresh= server.arg(0);
-  char refresh[3];
-  Serial.println(refresh);
-  srefresh.toCharArray(refresh,3);
+  char refresh[4];
+  srefresh.toCharArray(refresh,sizeof(refresh));
   if (!strcmp(refresh,"ON")) {
     refreshOn=true;
     //Serial.print("Refresh: on");
@@ -1055,59 +1487,7 @@ void handleRefresh() {
     //Serial.print("Refresh: off");
   }
   
-  server.send(200, "text/html", ejback);
-}
-
-static void decode_track0(uint8_t head, uint8_t cylinder) {
-
-  mfm_io_t io = {
-      .encode_compact = true,
-      .pulses = (uint8_t *)flux_datain0[head],
-      .n_pulses = flux_count_long * sizeof(long),
-      .sectors = track_data0,
-      .n_sectors = cur_format->sectors,
-      .head = head,
-      .cylinder = cylinder,
-      .n = cur_format->n,
-      .settings = cur_format->is_fm ? &standard_fm : &standard_mfm,
-  };
-  size_t pos = decode_track_mfm(&io);
-  Serial.printf("Decoded0 to %zu flux\n", pos);
-}
-
-static void encode_track0(uint8_t head, uint8_t cylinder) {
-
-  mfm_io_t io = {
-      .encode_compact = true,
-      .pulses = (uint8_t *)flux_data0[head],
-      .n_pulses = flux_count_long * sizeof(long),
-      .sectors = track_data0,
-      .n_sectors = cur_format->sectors,
-      .head = head,
-      .cylinder = cylinder,
-      .n = cur_format->n,
-      .settings = cur_format->is_fm ? &standard_fm : &standard_mfm,
-  };
-  size_t pos = encode_track_mfm(&io);
-  //Serial.printf("Encode head %d track %d \n",head,cylinder);
-   
-}
-
-static void encode_track1(uint8_t head, uint8_t cylinder) {
-
-  mfm_io_t io = {
-      .encode_compact = true,
-      .pulses = (uint8_t *)flux_data1[head],
-      .n_pulses = flux_count_long * sizeof(long),
-      .sectors = track_data1,
-      .n_sectors = cur_format->sectors,
-      .head = head,
-      .cylinder = cylinder,
-      .n = cur_format->n,
-      .settings = cur_format->is_fm ? &standard_fm : &standard_mfm,
-  };
-  size_t pos = encode_track_mfm(&io);
- // Serial.printf("Encoded1 to %zu flux\n", pos);
+  sendBack();
 }
 
 uint32_t swap32(uint32_t value) {
@@ -1186,9 +1566,150 @@ static void encode_track_HFE1(uint8_t head, uint8_t cylinder) {
     offset=offset+0x200;
   }  
 }
+
+/////////////////////////////////////////////////////////////////////////////
+// Write support - core 0 side
+/////////////////////////////////////////////////////////////////////////////
+
+static File32 &wr_file(int drive) { return drive ? file1 : file0; }
+static uint8_t *wr_track_buf(int drive) { return drive ? track_data1 : track_data0; }
+static uint8_t *drive_flux(int drive, int side) {
+  return (uint8_t *)(drive ? flux_data1[side] : flux_data0[side]);
+}
+
+// Load one side of a track from the image and generate its read flux
+static void load_and_encode_side(int drive, int track, int side) {
+  uint8_t *buf = wr_track_buf(drive);
+  if (img[drive].type == IMG_HFE) {
+    if (drive) encode_track_HFE1(side, track); else encode_track_HFE0(side, track);
+    return;
+  }
+  img_load_side(img[drive], wr_file(drive), track, side, buf, track_max_bytes);
+  img_encode_side(img[drive].side[side], buf, drive_flux(drive, side),
+                  flux_count_long * 4);
+}
+
+// Decode one write segment into the track buffer; returns the sectors updated
+static uint32_t wr_decode_segment(const wr_segment_t &sg, uint8_t *track_buf) {
+  uint32_t end = sg.end > WR_BUF_SIZE ? WR_BUF_SIZE : sg.end;
+  if (end <= sg.start)
+    return 0;
+  uint8_t *pulses = wr_pulses + sg.start;
+  size_t n_pulses = end - sg.start;
+  // raw PIO values -> interval length in counts (what mfm_impl.h expects)
+  for (size_t i = 0; i < n_pulses; i++) {
+    int v = 255 - pulses[i] + FLUXIN_OVERHEAD;
+    pulses[i] = v > 255 ? 255 : v;
+  }
+  // byte offset in the read flux where the write started (one word = 4 bytes)
+  int raw_pos = sg.pos >= 0 ? 4 * (sg.pos - WR_POS_LATENCY_WORDS) : -1;
+  const float t1 = FLUXIN_COUNT_HZ * cur_format->bit_time_ns * 1e-9f;
+  return img_decode_write(pulses, n_pulses, sg.overflow, raw_pos,
+                          img[sg.drive].side[sg.side], track_buf, wr_sector_tmp,
+                          sizeof(wr_sector_tmp), t1);
+}
+
+// Save the track being written to the SD card
+void wr_flush() {
+  if (!wr_sess.active)
+    return;
+  wr_update_flux();
+  if (wr_sess.dirty) {
+    uint32_t t0 = millis();
+    bool ok = img_write_sectors(img[wr_sess.drive], wr_file(wr_sess.drive),
+                                wr_sess.side, wr_track_buf(wr_sess.drive), wr_sess.dirty);
+    Serial.printf("WR: drive %d track %d side %d saved (sectors %02lx) %s, %lu ms\n",
+                  wr_sess.drive, wr_sess.track, wr_sess.side,
+                  (unsigned long)wr_sess.dirty, ok ? "OK" : "*** SD WRITE ERROR ***",
+                  (unsigned long)(millis() - t0));
+  }
+  wr_sess.active = false;
+  wr_sess.dirty = 0;
+}
+
+// Load the whole side from the image, so that written sectors are merged
+// with the existing ones and the read flux can be regenerated
+static bool wr_begin(int drive, int track, int side) {
+  if (wr_sess.active && (wr_sess.drive != drive || wr_sess.track != track ||
+                         wr_sess.side != side))
+    wr_flush();
+  if (wr_sess.active)
+    return true;
+  // data of the side being written (the sector list is the one in use for
+  // the read flux, so the positions match)
+  if (img[drive].side[side].track != track ||
+      !img_reload_data(img[drive], wr_file(drive), side, wr_track_buf(drive))) {
+    Serial.printf("WR: cannot read track %d side %d\n", track, side);
+    return false;
+  }
+  wr_sess.active = true;
+  wr_sess.drive = drive;
+  wr_sess.track = track;
+  wr_sess.side = side;
+  wr_sess.dirty = 0;
+  wr_sess.last_ms = millis();
+  return true;
+}
+
+static void wr_handle_segment(const wr_segment_t &sg) {
+  if (sg.drive < 0)
+    return; // write to a drive emulated by someone else on the bus
+  if (sg.end <= sg.start) {
+    Serial.println("WR: write lost (capture buffer full)");
+    return;
+  }
+  if (!(sg.drive ? wr_allowed1 : wr_allowed0)) {
+    Serial.printf("WR: drive %d is read only, write ignored\n", sg.drive);
+    return;
+  }
+  int cached = sg.drive ? cached_trackno1 : cached_trackno0;
+  if (sg.track != cached) {
+    Serial.printf("WR: track %d not loaded (%d), write ignored\n", sg.track, cached);
+    return;
+  }
+  if (!wr_begin(sg.drive, sg.track, sg.side))
+    return;
+  uint32_t mask = wr_decode_segment(sg, wr_track_buf(sg.drive));
+  wr_sess.last_ms = millis();
+  wr_last_ms[sg.drive] = wr_sess.last_ms;
+  Serial.printf("WR: drive %d track %d side %d pos %ld: %u pulses, sectors %02lx%s\n",
+                sg.drive, sg.track, sg.side, (long)sg.pos,
+                (unsigned)(sg.end - sg.start), (unsigned long)mask,
+                sg.overflow ? " (overflow)" : "");
+  if (!mask)
+    return;
+  wr_sess.dirty |= mask;
+  wr_sess.need_encode = true; // done by wr_process() when the queue is empty
+}
+
+// Regenerate the read flux in place, so that a verify read returns the new
+// data: the bytes outside the written sectors are identical, so the flux
+// being sent by core 1 is not disturbed.
+static void wr_update_flux() {
+  if (!wr_sess.active || !wr_sess.need_encode)
+    return;
+  wr_sess.need_encode = false;
+  img_encode_side(img[wr_sess.drive].side[wr_sess.side], wr_track_buf(wr_sess.drive),
+                  drive_flux(wr_sess.drive, wr_sess.side), flux_count_long * 4);
+}
+
+// Consume the segments queued by core 1
+static void wr_process() {
+  while (wr_tail != wr_head) {
+    __dmb();
+    wr_segment_t sg = wr_queue[wr_tail % WR_QUEUE_LEN];
+    wr_handle_segment(sg);
+    __dmb();
+    wr_tail = wr_tail + 1; // its pulses in wr_pulses[] are no longer needed
+  }
+  wr_update_flux();
+  if (wr_dropped) {
+    Serial.printf("WR: %lu writes lost (queue full)\n", (unsigned long)wr_dropped);
+    wr_dropped = 0;
+  }
+}
+
 void loop() {
-  static int cached_trackno0 = -1;
-  static int cached_trackno1 = -1;
   auto new_trackno0 = trackno0;
   auto new_trackno1 = trackno1;
   int motor_pin = !digitalRead(MOTOR_PIN);
@@ -1197,59 +1718,65 @@ void loop() {
   int inserted0 = digitalRead(DF0_EN);
   int inserted1 = digitalRead(DF1_EN);
   int side = !digitalRead(SIDE_PIN);
-
+  
+  //Serial.println(inserted0);
+  
   auto enabled0 = (motor_pin && select_pin0);  
   auto enabled1 = (motor_pin && select_pin1);
-  if (!filename0[0]) enabled0=0;
-  if (!filename1[0]) enabled1=0;
+  if (!filename0[0] || img_err0) enabled0=0;
+  if (!filename1[0] || img_err1) enabled1=0;
   
   
-  writeon0 = (!digitalRead(WRGATE_PIN));
-  if (writeon0) {
-    writeTRK();
-    Serial.println("Write ON ++++");
+  // Write support: decode what core 1 captured, then save the track when
+  // the write session is over (before a new track can be loaded)
+  wr_process();
+  if (wr_sess.active) {
+    int d = wr_sess.drive;
+    bool en = d ? enabled1 : enabled0;
+    int trk = d ? trackno1 : trackno0;
+    // (with the drive deselected the data is kept: it is saved after
+    // WR_IDLE_MS like after any write)
+    if (trk != wr_sess.track || millis() - wr_sess.last_ms > WR_IDLE_MS)
+      wr_flush();
   }
+
+  // Write protect of the selected drive (active LOW)
+  bool wprot = false;
+  if (select_pin0 && filename0[0]) wprot = !wr_allowed0;
+  else if (select_pin1 && filename1[0]) wprot = !wr_allowed1;
+  digitalWrite(PROT_PIN, wprot ? LOW : HIGH);
+
+  // TRACK 0 of the selected drive (active LOW): each drive has its own head
+  if (select_pin0) digitalWrite(TRK0_PIN, trackno0 != 0);
+  else if (select_pin1) digitalWrite(TRK0_PIN, trackno1 != 0);
     
    //auto enabled = true;
-  curtrack0=trackno0;curtrack1=trackno1;  
+  curtrack0=trackno0;curtrack1=trackno1;
+  ui_active0 = enabled0; ui_active1 = enabled1;  
        
-  if (!enabled0) { 
-    fluxout0 = -1; cached_trackno0 = -1; new_trackno0=0;trackno0=0;
+  if (!enabled0) { // no flux while not selected / motor off
+    fluxout0 = -1;
     fluxin0 = -1;
-    //Serial.println("flushed 0 .......");
-    } // poivia
-  if (!enabled1) { 
-    fluxout1 = -1; cached_trackno1 = -1; new_trackno1=0;trackno1=0;
-    //Serial.println("flushed 1 .......");
-    } 
-   //poivia
-  static bool old_enabled0 = false, old_enabled1 = false, old_select_pin0 = false,
-              old_select_pin1 = false, old_motor_pin = false;
+#if RESET_ON_DESELECT
+    cached_trackno0 = -1; new_trackno0=0;trackno0=0; // poivia
+#endif
+  }
+  if (!enabled1) {
+    fluxout1 = -1;
+#if RESET_ON_DESELECT
+    cached_trackno1 = -1; new_trackno1=0;trackno1=0; // poivia
+#endif
+  }
   static bool old_inserted0 = false, old_inserted1 = false;
- 
-  if (motor_pin != old_motor_pin) {
-    Serial.printf("motor_pin -> %s\n", motor_pin ? "true" : "false");
-    old_motor_pin = motor_pin;
+#if DEBUG_BUS
+  static int old_bus = -1;
+  int bus = motor_pin | (select_pin0 << 1) | (select_pin1 << 2);
+  if (bus != old_bus) {
+    Serial.printf("BUS: motor=%d sel0=%d sel1=%d trk=%d/%d\n", motor_pin, select_pin0,
+                  select_pin1, trackno0, trackno1);
+    old_bus = bus;
   }
-  
-  if (select_pin0 != old_select_pin0) {
-    Serial.printf("select_pin0 -> %s\n", select_pin0 ? "true" : "false");
-    old_select_pin0 = select_pin0;
-  }
-  
-  if (select_pin1 != old_select_pin1) {
-    Serial.printf("select_pin1 -> %s\n", select_pin1 ? "true" : "false");
-    old_select_pin1 = select_pin1;
-  }
-  
-  if (enabled0 != old_enabled0) {
-    Serial.printf("enabled0 -> %s\n", enabled0 ? "true" : "false");
-    old_enabled0 = enabled0;
-  }
-  if (enabled1 != old_enabled1) {
-    Serial.printf("enabled1 -> %s\n", enabled0 ? "true" : "false");
-    old_enabled1 = enabled1;
-  }
+#endif
   
   if (inserted0 != old_inserted0) {
     Serial.printf("inserted0 -> %s\n", inserted0 ? "true" : "false");
@@ -1263,59 +1790,19 @@ void loop() {
   if ((cur_format && new_trackno0 != cached_trackno0) &&(enabled0)) {
     fluxout0 = -1;
     fluxin0 = -1;
-    //Serial.printf("Preparing flux0 data for track %d\n", new_trackno0);
-    int sector_count = cur_format->sectors;
-    int side_count = cur_format->sides;
-    int sector_size = 128 << cur_format->n;
-    size_t offset = sector_size * sector_count * side_count * new_trackno0;
-    size_t count = sector_size * sector_count;
-    int dummy_byte = new_trackno0 * side_count;
-    file0.seek(offset);
-    for (auto side = 0; side < side_count; side++) {
-      int n = file0.read(track_data0, count);
-      if (n != count) {
-        Serial.println("Read file0 failed -- using dummy data");
-        //make_dummy_data(side, new_trackno0, count);
-      } else {
-        if (!HFE0_On) {
-          encode_track0(side, new_trackno0);
-        } else {
-          encode_track_HFE0(side, new_trackno0);
-        }
-      }
-    }
-   // Serial.println("flux0 data prepared");
+    for (int sd = 0; sd < 2; sd++)
+      load_and_encode_side(0, new_trackno0, sd);
     cached_trackno0 = new_trackno0;
-  } 
+  }
   fluxout0 =
       (cur_format != NULL && enabled0 && cached_trackno0 == trackno0) ? side : -1;
   //fluxin0=fluxout0;
   
   if ((cur_format && new_trackno1 != cached_trackno1)&&(enabled1)) {
     fluxout1 = -1;
-    //Serial.printf("------------->Preparing flux1 data for track %d\n", new_trackno1); 
-    int sector_count = cur_format->sectors;
-    int side_count = cur_format->sides;
-    int sector_size = 128 << cur_format->n;
-    size_t offset = sector_size * sector_count * side_count * new_trackno1;
-    size_t count = sector_size * sector_count;
-    int dummy_byte = new_trackno1 * side_count;
-    file1.seek(offset);
-    for (auto side = 0; side < side_count; side++) {
-      int n = file1.read(track_data1, count);
-      if (n != count) {
-        Serial.println("Read file1 failed -- using dummy data");
-      //make_dummy_data(side, new_trackno0, count);
-      } else {
-        if (!HFE1_On) {
-          encode_track1(side, new_trackno1);
-        } else {
-          encode_track_HFE1(side, new_trackno1);
-        }
-      }
-    }
-    //Serial.println("flux1 data prepared");
-    cached_trackno1 = new_trackno1;  
+    for (int sd = 0; sd < 2; sd++)
+      load_and_encode_side(1, new_trackno1, sd);
+    cached_trackno1 = new_trackno1;
   }
   fluxout1 =
    (cur_format != NULL && enabled1 && cached_trackno1 == trackno1) ? side : -1;
@@ -1323,20 +1810,26 @@ void loop() {
   // this is not correct handling of the ready/disk change flag. on my test
   // computer, just leaving the pin HIGH works, while immediately reporting LOW
   // on the "ready / disk change:
-  //digitalWrite(READY_PIN, !motor_pin); 
+  
+  digitalWrite(READY_PIN, !motor_pin); //poivia
    
   //if ((enabled0)||(enabled1)) {
   if ((inserted0)||(inserted1)) {
       //pinMode(READY_PIN,OUTPUT);
       digitalWrite(READY_PIN, LOW);
       digitalWrite(LVC245_EN, HIGH); // Output when HIGH
+   //   Serial.println("ready");
     } else {
      // pinMode(READY_PIN,INPUT);
-     digitalWrite(LVC245_EN, LOW); // Output when HIGH
+      digitalWrite(LVC245_EN, LOW); // Output when HIGH
+   //  Serial.println("not ready");
     }
        
-  server.handleClient();
-  server.client();
-  MDNS.update();
+  // While the X68000 is writing, keep core 0 free for the write handling
+  if (!wr_sess.active) {
+    server.handleClient();
+    server.client();
+    MDNS.update();
+  }
 
 }
