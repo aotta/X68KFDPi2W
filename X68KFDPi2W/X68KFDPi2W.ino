@@ -26,6 +26,11 @@
 #define BUS_ON_INSERTED 0     // 1 = READY and bus outputs (74LVC245) on while a
                               // disk is inserted (DF0_EN/DF1_EN); 0 = only while
                               // an emulated drive is enabled (motor + select)
+// 1 = when the other Pico reports a disk inserted, pull READY low for
+// READY_PULSE_MS: the FDC (uPD72065) sees a READY change and raises its
+// interrupt, as when a disk goes into a real drive (needed by Valis II)
+#define READY_PULSE_ON_INSERT 1
+#define READY_PULSE_MS 50
 #define TRK0_FOLLOWS_SELECT 0 // 1 = TRACK 0 output updated for the selected drive
                               // at every loop; 0 = updated at every step only
 bool HFE0_On=false,HFE1_On=false;   
@@ -234,6 +239,7 @@ struct {
 } wr_sess;
 
 bool wr_allowed0 = false, wr_allowed1 = false;
+volatile bool drv_nodisk[2] = {false, false};  // the other Pico reports no disk (web page)
 // highest head position of each drive: 77 as in the 03/2025 release, more
 // only for images with more than 78 cylinders
 volatile int max_track[2] = {77, 77};
@@ -784,7 +790,8 @@ static void webDriveCard(int idx) {
   char tmp[160];
   snprintf(tmp, sizeof(tmp), "<div class='drv'><h2><span class='led' id='l%d'></span>Drive %d</h2>", idx, num);
   webOut(tmp);
-  snprintf(tmp, sizeof(tmp), "<div class='img' id='i%d' title='", idx);
+  snprintf(tmp, sizeof(tmp), "<div class='img' id='i%d' data-e='%d' title='", idx,
+           (int)drv_nodisk[idx]);
   webOut(tmp);
   webHtml(fname);
   webOut("'>");
@@ -801,6 +808,8 @@ static void webDriveCard(int idx) {
     webOut(imageTypeName(idx));
     webOut("</span>");
   }
+  if (loaded && drv_nodisk[idx])
+    webOut("<span class='tag ro' title='No disk in the drive: press the insert button'>NO DISK</span>");
   if (!strcmp(fname, idx ? default1 : default0))
     webOut(loaded ? "<span class='tag def' title='Loaded at power on'>&#9733; DEFAULT</span>"
                   : "<span class='tag def' title='Empty at power on'>&#9733; DEFAULT (empty)</span>");
@@ -898,7 +907,7 @@ void handleRoot() {
          "function u(){fetch('/status').then(r=>r.json()).then(s=>{s.d.forEach((d,i)=>{"
          "document.getElementById('t'+i).textContent=d.t;"
          "document.getElementById('l'+i).className='led'+(d.w?' wr':d.a?' on':'');"
-         "var e=document.getElementById('i'+i);if(e.title!=d.f)location.reload();});})"
+         "var e=document.getElementById('i'+i);if(e.title!=d.f||e.dataset.e!=d.e)location.reload();});})"
          ".catch(()=>{}).finally(()=>setTimeout(u,1000));}u();"
          "</script></body></html>");
   webFlush();
@@ -999,8 +1008,9 @@ void handleStatus() {
   for (int i = 0; i < 2; i++) {
     char tmp[64];
     bool writing = wr_last_ms[i] && millis() - wr_last_ms[i] < 1500;
-    snprintf(tmp, sizeof(tmp), "%s{\"t\":%d,\"a\":%d,\"w\":%d,\"f\":\"", i ? "," : "",
-             i ? curtrack1 : curtrack0, (int)(i ? ui_active1 : ui_active0), (int)writing);
+    snprintf(tmp, sizeof(tmp), "%s{\"t\":%d,\"a\":%d,\"w\":%d,\"e\":\"%d\",\"f\":\"", i ? "," : "",
+             i ? curtrack1 : curtrack0, (int)(i ? ui_active1 : ui_active0), (int)writing,
+             (int)drv_nodisk[i]);
     webOut(tmp);
     webJson(i ? filename1 : filename0);
     webOut("\"}");
@@ -1743,6 +1753,19 @@ void loop() {
   int select_pin1 = !digitalRead(SELECT_PINB);
   int inserted0 = digitalRead(DF0_EN);
   int inserted1 = digitalRead(DF1_EN);
+  drv_nodisk[0] = !inserted0;
+  drv_nodisk[1] = !inserted1;
+#if READY_PULSE_ON_INSERT
+  static int rp_prev0 = -1, rp_prev1 = -1;
+  static uint32_t ready_pulse_until = 0;
+  if ((rp_prev0 == 0 && inserted0) || (rp_prev1 == 0 && inserted1)) {
+    ready_pulse_until = millis() + READY_PULSE_MS;
+    if (!ready_pulse_until) ready_pulse_until = 1;
+    Serial.printf("READY pulse (disk inserted)\n");
+  }
+  rp_prev0 = inserted0; rp_prev1 = inserted1;
+  if (ready_pulse_until && (int32_t)(millis() - ready_pulse_until) >= 0) ready_pulse_until = 0;
+#endif
   int side = !digitalRead(SIDE_PIN);
   
   //Serial.println(inserted0);
@@ -1751,6 +1774,7 @@ void loop() {
   auto enabled1 = (motor_pin && select_pin1);
   if (!filename0[0] || img_err0) enabled0=0;
   if (!filename1[0] || img_err1) enabled1=0;
+
   
   
   // Write support: decode what core 1 captured, then save the track when
@@ -1843,6 +1867,12 @@ void loop() {
   digitalWrite(READY_PIN, !motor_pin); //poivia
 #endif
    
+#if READY_PULSE_ON_INSERT
+  if (ready_pulse_until) {
+      digitalWrite(READY_PIN, LOW);
+      digitalWrite(LVC245_EN, HIGH); // Output when HIGH
+  } else
+#endif
 #if BUS_ON_INSERTED
   if ((inserted0)||(inserted1)) {
 #else
