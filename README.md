@@ -38,6 +38,20 @@ Writing to floppy images is supported: the X68000 can copy files, format disks (
 - `RESET_ON_DESELECT` (default 1): the head goes back to track 0 when the drive is deselected or the motor stops. Needed by games that ask to swap disks (e.g. A-JAX).
 - `BUS_ON_INSERTED` (default 0): READY and the bus outputs (74LVC245) are active only while an emulated drive is in use (motor on and drive selected), as in the 03/2025 release. With 1 they follow the disk inserted signals, and some games (e.g. Dracula) hang after loading Human68k.
 - `READY_FOLLOWS_MOTOR`, `DF_EN_PULLDOWN`, `TRK0_FOLLOWS_SELECT` (default 0): experimental behaviours, off.
+- `READY_PULSE_ON_INSERT` (default 1): when a disk is inserted (button), READY goes low for `READY_PULSE_MS` (50 ms). The FDC sees a READY change, as with a real drive; needed by games that wait for the new disk after an eject (e.g. Valis II).
+
+### Eject / insert controller (X68kfdPico1_11, plain Pico)
+
+The second Pico handles the X68000 OPTION_SEL protocol (eject, lock, LED blink, disk in drive, interrupt). Version 1.10:
+
+- The protocol runs on core 1 in a tight loop and answers an OPTION_SEL access in about 0.2 µs; buttons, LEDs and the serial log run on core 0.
+- /DISK_IN_DRIVE reports the drive addressed by the last OPTION_SEL and goes HIGH (no disk) as soon as a drive that is not ours is addressed (before, drives 2/3 looked inserted).
+- /INT is asserted at every disk change (eject by the X68000, button) and cleared by the next access to that drive; if it is not served it is pulsed again every 100 ms.
+- The eject is ignored when the lock signal is active in the same access; buttons count only when held 30 ms.
+- Options at the top of the sketch: `FORCE_DRIVE01` (1 = always drives 0/1, 0 = read the INTEXT jumper), `DIAG` (1 = print the OPTION_SEL accesses every second), `EJECT_DELAY_MS`, `INT_REPEAT_MS`, `INT_GAP_US`, `BUTTON_MS`.
+- Board: "Raspberry Pi Pico".
+
+Valis II (original Japanese version): after the intro the game ejects disk A and waits, without any message, for the next disk (Disk D) in drive 0. Load it in drive 0 from the web page and press the insert button of drive 0.
 
 ### Building the firmware
 
